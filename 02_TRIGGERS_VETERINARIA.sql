@@ -1,369 +1,297 @@
 ﻿/* =====================================================================
-   VETERINARIA - CONSULTAS Y PRUEBAS (SQL Server 2025)
-   Migrado desde PostgreSQL.
+   VETERINARIA - TRIGGERS (SQL Server 2025)
+   Migrado desde PostgreSQL (PL/pgSQL).
 
-   Equivalencias usadas:
-   - LIMIT n                          -> SELECT TOP (n)
-   - current_date                     -> CAST(GETDATE() AS DATE)
-   - extract(month/year ...)          -> rangos de fechas (aprovechan indices)
-   - interval '6 months'              -> DATEADD(MONTH, -6, ...)
-   - string_agg(x, ', ' order by x)   -> STRING_AGG(x, ', ') WITHIN GROUP (ORDER BY x)
-   - || (concatenar)                  -> CONCAT()
-   - GROUP BY por alias               -> GROUP BY por columna (T-SQL no permite alias)
+   Diferencias clave respecto a PostgreSQL:
+   - No existe BEFORE ni FOR EACH ROW. Los triggers se ejecutan UNA vez por
+     sentencia (pueden afectar muchas filas) y leen las tablas virtuales
+     "inserted" y "deleted". Por eso todo se escribe con logica de conjuntos.
+   - Los triggers "BEFORE" de validacion pasan a ser AFTER: validan y, si hay
+     error, hacen ROLLBACK TRANSACTION + THROW para deshacer la operacion.
+   - RAISE EXCEPTION -> THROW (numero de error >= 50000).
+   - No hay funcion separada: el cuerpo va dentro del propio trigger.
    ===================================================================== */
 
 USE Veterinaria;
 GO
 
-/* =====================================================================
-   A) CONSULTAS DEL PROYECTO
-   ===================================================================== */
+/* ---------------------------------------------------------------------
+   1) Recalcular el monto de la factura al cambiar su detalle
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER facturacion.trg_actualizar_monto_factura
+ON facturacion.Detalle_Factura
+AFTER INSERT, UPDATE, DELETE
+AS
+BEGIN
+    SET NOCOUNT ON;
 
--- 1. Mascotas mas atendidas en el mes y anio actuales
-SELECT TOP (5)
-       m.Nombre AS mascota,
-       COUNT(c.ID_Mascota) AS veces_atendido
-FROM   Mascota m
-JOIN   Cita c ON m.ID_Mascota = c.ID_Mascota
-WHERE  c.Fecha >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
-  AND  c.Fecha <  DATEADD(MONTH, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
-GROUP BY m.ID_Mascota, m.Nombre
-ORDER BY COUNT(c.ID_Mascota) DESC;
+    -- Facturas afectadas: las de las filas nuevas/modificadas y las de las borradas
+    UPDATE f
+    SET    f.Monto = ISNULL((SELECT SUM(d.Precio_Unitario * d.Cantidad)
+                             FROM   facturacion.Detalle_Factura d
+                             WHERE  d.Num_Factura = f.Num_Factura), 0)
+    FROM   facturacion.Factura f
+    WHERE  f.Num_Factura IN (SELECT Num_Factura FROM inserted
+                             UNION
+                             SELECT Num_Factura FROM deleted);
+END;
 GO
 
--- 2. Veterinarios ordenados segun el mayor numero de citas en el segundo trimestre del anio actual
-SELECT v.Nombre AS veterinario,
-       COUNT(c.ID_Cita) AS numero_citas
-FROM   Veterinario v
-JOIN   Cita c ON v.ID_Veterinario = c.ID_Veterinario
-WHERE  c.Fecha >= DATEFROMPARTS(YEAR(GETDATE()), 4, 1)
-  AND  c.Fecha <  DATEFROMPARTS(YEAR(GETDATE()), 7, 1)
-GROUP BY v.ID_Veterinario, v.Nombre
-ORDER BY numero_citas DESC;
+/* ---------------------------------------------------------------------
+   2) Bloquear medicamentos cuyas precauciones mencionan la especie
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER clinica.trg_verificar_alergia_medicamento
+ON clinica.Tratamiento
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @msg NVARCHAR(2000);
+
+    SELECT TOP (1)
+           @msg = CONCAT(
+               'ALERTA VETERINARIA: La mascota "', m.Nombre, '" es de especie "', m.Especie,
+               '". El medicamento "', it.Descripcion, '" indica contraindicacion/alergia: "',
+               med.Precauciones, '". Registro denegado.')
+    FROM   inserted i
+    JOIN   clinica.Diagnostico d       ON d.ID_Diagnostico = i.ID_Diagnostico
+    JOIN   clinica.Cita c              ON c.ID_Cita        = d.ID_Cita
+    JOIN   clientes.Mascota m           ON m.ID_Mascota     = c.ID_Mascota
+    JOIN   catalogo.Medicamento med     ON med.ID_Medicamento = i.ID_Medicamento
+    JOIN   catalogo.Item_Facturable it  ON it.ID_Item       = med.ID_Medicamento
+    -- CHARINDEX evita problemas con comodines; el COLLATE replica el ILIKE de Postgres
+    WHERE  CHARINDEX(m.Especie COLLATE Latin1_General_CI_AS,
+                     med.Precauciones COLLATE Latin1_General_CI_AS) > 0;
+
+    IF @msg IS NOT NULL
+    BEGIN
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        THROW 50001, @msg, 1;
+    END
+END;
 GO
 
--- 3. Medicamentos prescritos con mayor frecuencia
-SELECT TOP (3)
-       i.Descripcion AS medicamento,
-       COUNT(t.ID_Medicamento) AS veces_prescrito
-FROM   Medicamento m
-JOIN   Tratamiento t       ON m.ID_Medicamento = t.ID_Medicamento
-JOIN   Item_Facturable i   ON m.ID_Medicamento = i.ID_Item
-GROUP BY m.ID_Medicamento, i.Descripcion
-ORDER BY veces_prescrito DESC;
+/* ---------------------------------------------------------------------
+   3) Verificar stock y descontar inventario al facturar un medicamento
+      (si el item es un procedimiento, no hay fila en Medicamento y no
+       se toca el inventario)
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER facturacion.trg_actualizar_inventario
+ON facturacion.Detalle_Factura
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Total solicitado por medicamento (un INSERT puede traer varias filas del mismo item)
+    DECLARE @solicitado TABLE (ID_Item BIGINT PRIMARY KEY, Cantidad BIGINT NOT NULL);
+
+    INSERT INTO @solicitado (ID_Item, Cantidad)
+    SELECT i.ID_Item, SUM(i.Cantidad)
+    FROM   inserted i
+    JOIN   catalogo.Medicamento med ON med.ID_Medicamento = i.ID_Item
+    GROUP BY i.ID_Item;
+
+    -- Validar disponibilidad
+    DECLARE @msg NVARCHAR(2000);
+
+    SELECT TOP (1)
+           @msg = CONCAT('Inventario insuficiente para el medicamento ID: ', s.ID_Item,
+                         '. Disponible: ', med.Stock, ', Solicitado: ', s.Cantidad)
+    FROM   @solicitado s
+    JOIN   catalogo.Medicamento med ON med.ID_Medicamento = s.ID_Item
+    WHERE  med.Stock < s.Cantidad;
+
+    IF @msg IS NOT NULL
+    BEGIN
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        THROW 50002, @msg, 1;
+    END
+
+    -- Descontar existencias
+    UPDATE med
+    SET    med.Stock = med.Stock - s.Cantidad
+    FROM   catalogo.Medicamento med
+    JOIN   @solicitado s ON s.ID_Item = med.ID_Medicamento;
+END;
 GO
 
--- 4. Ingresos totales por especialidad veterinaria
-SELECT e.Nombre AS especialidad,
-       SUM(f.Monto) AS ingresos_totales
-FROM   Especialidad e
-JOIN   Veterinario_Especialidad ve ON e.ID_Especialidad = ve.ID_Especialidad
-JOIN   Veterinario v               ON ve.ID_Veterinario = v.ID_Veterinario
-JOIN   Cita c                      ON v.ID_Veterinario  = c.ID_Veterinario
-JOIN   Factura f                   ON c.ID_Cita         = f.ID_Cita
-GROUP BY e.ID_Especialidad, e.Nombre
-ORDER BY ingresos_totales DESC;
+/* ---------------------------------------------------------------------
+   4) Cancelar automaticamente citas con fecha pasada que no esten en
+      estado terminal (Cancelada / Completada)
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER clinica.trg_actualizacion_citas
+ON clinica.Cita
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE c
+    SET    c.Estado = 'Cancelada'
+    FROM   clinica.Cita c
+    JOIN   inserted i ON i.ID_Cita = c.ID_Cita
+    WHERE  i.Estado NOT IN ('Cancelada', 'Completada')
+      AND  i.Fecha < CAST(GETDATE() AS DATE);
+END;
 GO
 
--- 5. Propietarios con mascotas que han asistido a citas en los ultimos 6 meses
-SELECT DISTINCT
-       p.Nombre AS propietario,
-       m.Nombre AS mascota
-FROM   Propietario p
-JOIN   Mascota m ON p.ID_Propietario = m.ID_Propietario
-JOIN   Cita c    ON m.ID_Mascota     = c.ID_Mascota
-WHERE  c.Fecha >= DATEADD(MONTH, -6, CAST(GETDATE() AS DATE))
-ORDER BY p.Nombre;
+/* ---------------------------------------------------------------------
+   5) Procedimiento: cancelar en bloque las citas vencidas
+      (en Postgres era PROCEDURE; se ejecuta con EXEC)
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE clinica.citas_completadas_portiempo_vencido
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE clinica.Cita
+    SET    Estado = 'Cancelada'
+    WHERE  Fecha < CAST(GETDATE() AS DATE)
+      AND  Estado NOT IN ('Completada', 'Cancelada');
+END;
 GO
 
--- 6. Propietarios con mas de una mascota
-SELECT p.Nombre AS propietario,
-       STRING_AGG(m.Nombre, ', ') WITHIN GROUP (ORDER BY m.Nombre) AS mascotas,
-       COUNT(m.ID_Mascota) AS cantidad_mascotas
-FROM   Propietario p
-JOIN   Mascota m ON p.ID_Propietario = m.ID_Propietario
-GROUP BY p.ID_Propietario, p.Nombre   -- se agrupa tambien por ID para no mezclar homonimos
-HAVING COUNT(m.ID_Mascota) > 1
-ORDER BY cantidad_mascotas DESC;
+/* ---------------------------------------------------------------------
+   6) Validar que la factura se emita al duenio real de la mascota
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER facturacion.trg_seguridad_facturacion
+ON facturacion.Factura
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Si es un UPDATE que no toca estas columnas, no hay nada que validar
+    IF NOT (UPDATE(ID_Cita) OR UPDATE(ID_Propietario))
+        RETURN;
+
+    DECLARE @msg NVARCHAR(2000);
+
+    SELECT TOP (1)
+           @msg = CONCAT(
+               'VIOLACION DE LOGICA DE NEGOCIO: Intento de fraude o error. El cliente (ID: ',
+               i.ID_Propietario, ') no es el duenio de la mascota de la cita ', i.ID_Cita,
+               '. El duenio legitimo es el cliente (ID: ', m.ID_Propietario, ').')
+    FROM   inserted i
+    JOIN   clinica.Cita c    ON c.ID_Cita    = i.ID_Cita
+    JOIN   clientes.Mascota m ON m.ID_Mascota = c.ID_Mascota
+    WHERE  i.ID_Propietario <> m.ID_Propietario;
+
+    IF @msg IS NOT NULL
+    BEGIN
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        THROW 50003, @msg, 1;
+    END
+END;
 GO
 
+/* ---------------------------------------------------------------------
+   7) Al registrar un pago: calcular saldo (Parcial / Pagado) y marcar
+      la cita como Completada
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER facturacion.trg_procesar_pago_estado
+ON facturacion.Pago
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-/* =====================================================================
-   B) CONSULTAS DE VERIFICACION / PRUEBA
-   ===================================================================== */
+    -- Estado financiero de las facturas que recibieron pagos
+    UPDATE f
+    SET    f.Estado_Pago = CASE WHEN t.Total_Pagado >= f.Monto THEN 'Pagado' ELSE 'Parcial' END
+    FROM   facturacion.Factura f
+    JOIN  (SELECT p.Num_Factura, SUM(p.Monto) AS Total_Pagado
+           FROM   facturacion.Pago p
+           WHERE  p.Num_Factura IN (SELECT Num_Factura FROM inserted)
+           GROUP BY p.Num_Factura) t
+           ON t.Num_Factura = f.Num_Factura;
 
--- Ver que los montos coincidan en las facturas
-/*
-SELECT f.Num_Factura,
-       f.Monto AS monto_guardado,
-       COALESCE(SUM(df.Precio_Unitario * df.Cantidad), 0) AS monto_calculado
-FROM   Factura f
-LEFT JOIN Detalle_Factura df ON f.Num_Factura = df.Num_Factura
-GROUP BY f.Num_Factura, f.Monto
-HAVING f.Monto <> COALESCE(SUM(df.Precio_Unitario * df.Cantidad), 0);
-*/
+    -- Dar por finalizada la atencion medica
+    UPDATE c
+    SET    c.Estado = 'Completada'
+    FROM   clinica.Cita c
+    JOIN   facturacion.Factura f ON f.ID_Cita = c.ID_Cita
+    WHERE  f.Num_Factura IN (SELECT Num_Factura FROM inserted)
+      AND  c.Estado <> 'Completada';
+END;
+GO
 
--- Confirmar que los IDs de las facturas coincidan con los propietarios de las mascotas
+/* ---------------------------------------------------------------------
+   8) NUEVO: impedir sobrepagos. La suma de los abonos de una factura
+      nunca puede superar el monto de la factura.
+      (Cada abono queda guardado como una fila en Pago, aunque la factura
+       siga en estado Parcial; ver las vistas de abajo.)
+   --------------------------------------------------------------------- */
+CREATE OR ALTER TRIGGER facturacion.trg_validar_sobrepago
+ON facturacion.Pago
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF NOT (UPDATE(Monto) OR UPDATE(Num_Factura))
+        RETURN;
+
+    DECLARE @msg NVARCHAR(2000);
+
+    -- UPDLOCK/HOLDLOCK: evita que dos pagos simultaneos pasen la validacion a la vez
+    SELECT TOP (1)
+           @msg = CONCAT('PAGO RECHAZADO: La factura ', f.Num_Factura, ' es por $', f.Monto,
+                         ' y con este pago el total abonado seria $', t.Total_Pagado,
+                         ' (excede por $', t.Total_Pagado - f.Monto, ').')
+    FROM   facturacion.Factura AS f WITH (UPDLOCK, HOLDLOCK)
+    JOIN  (SELECT p.Num_Factura, SUM(p.Monto) AS Total_Pagado
+           FROM   facturacion.Pago p
+           WHERE  p.Num_Factura IN (SELECT Num_Factura FROM inserted)
+           GROUP BY p.Num_Factura) t
+           ON t.Num_Factura = f.Num_Factura
+    WHERE  t.Total_Pagado > f.Monto;
+
+    IF @msg IS NOT NULL
+    BEGIN
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        THROW 50004, @msg, 1;
+    END
+END;
+GO
+
+/* ---------------------------------------------------------------------
+   9) NUEVO: vistas para consultar abonos y saldos
+   --------------------------------------------------------------------- */
+-- Estado de cuenta: una fila por factura
+CREATE OR ALTER VIEW facturacion.vw_estado_cuenta_factura
+AS
 SELECT f.Num_Factura,
        f.ID_Cita,
-       c.ID_Mascota,
-       m.ID_Propietario AS propietario_correcto,
-       f.ID_Propietario AS propietario_en_factura
-FROM   Factura f
-JOIN   Cita c    ON f.ID_Cita    = c.ID_Cita
-JOIN   Mascota m ON c.ID_Mascota = m.ID_Mascota
-WHERE  f.ID_Propietario <> m.ID_Propietario;
+       f.ID_Propietario,
+       f.Monto                                  AS Total_Factura,
+       ISNULL(SUM(p.Monto), 0)                  AS Total_Abonado,
+       f.Monto - ISNULL(SUM(p.Monto), 0)        AS Saldo_Pendiente,
+       COUNT(p.ID_Pago)                         AS Num_Abonos,
+       f.Estado_Pago
+FROM   facturacion.Factura f
+LEFT JOIN facturacion.Pago p ON p.Num_Factura = f.Num_Factura
+GROUP BY f.Num_Factura, f.ID_Cita, f.ID_Propietario, f.Monto, f.Estado_Pago;
 GO
 
--- Revisar que todos los diagnosticos de los tratamientos existan
-/*
-SELECT *
-FROM   Tratamiento t
-LEFT JOIN Diagnostico d ON t.ID_Diagnostico = d.ID_Diagnostico
-WHERE  d.ID_Diagnostico IS NULL;
-*/
-
--- Revisar que todos los diagnosticos tengan procedimientos validos
-/*
-SELECT *
-FROM   Diagnostico_Procedimiento dp
-LEFT JOIN Procedimiento p ON dp.ID_Procedimiento = p.ID_Procedimiento
-WHERE  p.ID_Procedimiento IS NULL;
-*/
-
--- Verificar que los precios coincidan con el costo del item
-/*
-SELECT df.Num_Factura, df.ID_Item, df.Precio_Unitario, i.Costo
-FROM   Detalle_Factura df
-JOIN   Item_Facturable i ON df.ID_Item = i.ID_Item
-WHERE  df.Precio_Unitario <> i.Costo;
-
-SELECT ID_Item, Descripcion, Costo FROM Item_Facturable ORDER BY ID_Item;
-SELECT ID_Item, Cantidad, Precio_Unitario, ID_Detalle FROM Detalle_Factura ORDER BY ID_Item;
-*/
-
--- Revisar las facturas (detalle concatenado por factura)
-/*
-SELECT f.Num_Factura,
-       f.Fecha,
-       p.Nombre AS propietario,
-       m.Nombre AS mascota,
-       STRING_AGG(CONCAT(i.Descripcion, ' (x', df.Cantidad, ', $', df.Precio_Unitario, ')'), ' | ')
-           WITHIN GROUP (ORDER BY df.ID_Detalle) AS detalles,
-       f.Monto
-FROM   Factura f
-JOIN   Cita c               ON f.ID_Cita     = c.ID_Cita
-JOIN   Mascota m            ON c.ID_Mascota  = m.ID_Mascota
-JOIN   Propietario p        ON m.ID_Propietario = p.ID_Propietario
-JOIN   Detalle_Factura df   ON f.Num_Factura = df.Num_Factura
-JOIN   Item_Facturable i    ON df.ID_Item    = i.ID_Item
-GROUP BY f.Num_Factura, f.Fecha, p.Nombre, m.Nombre, f.Monto
-ORDER BY f.Num_Factura;
-*/
-
-
-/* =====================================================================
-   C) CORRECCIONES DE DATOS (estaban en el archivo original de consultas)
-   Se ejecutan una sola vez, despues de cargar el DML.
-   ===================================================================== */
-
--- Actualizar ciertas facturas
-UPDATE Factura SET ID_Propietario = 13 WHERE ID_Cita = 15;
-UPDATE Factura SET ID_Propietario = 2  WHERE ID_Cita = 13;
-UPDATE Factura SET ID_Propietario = 12 WHERE ID_Cita = 14;
-GO
-
--- Esta da error a proposito: valida el trigger trg_seguridad_facturacion
--- (la cita 13 pertenece al propietario 2, no al 13)
--- UPDATE Factura SET ID_Propietario = 13 WHERE ID_Cita = 13;
-
--- Alinear precios del detalle con el costo del item
-UPDATE Detalle_Factura SET Precio_Unitario = 12  WHERE ID_Item = 12;
-UPDATE Detalle_Factura SET Precio_Unitario = 12  WHERE ID_Item = 1;
-UPDATE Detalle_Factura SET Precio_Unitario = 15  WHERE ID_Item = 10;
-UPDATE Detalle_Factura SET Precio_Unitario = 22  WHERE ID_Item = 11;
-UPDATE Detalle_Factura SET Precio_Unitario = 18  WHERE ID_Item = 13;
-UPDATE Detalle_Factura SET Precio_Unitario = 20  WHERE ID_Item = 15;
-UPDATE Detalle_Factura SET Precio_Unitario = 9   WHERE ID_Item = 18;
-UPDATE Detalle_Factura SET Precio_Unitario = 15  WHERE ID_Item = 22;
-UPDATE Detalle_Factura SET Precio_Unitario = 350 WHERE ID_Item = 29;
-UPDATE Detalle_Factura SET Precio_Unitario = 30  WHERE ID_Item = 33;
-GO
-
-
-/* =====================================================================
-   D) PRUEBAS DE TRIGGERS
-   Cada prueba va en su propio lote (GO): cuando un trigger lanza error,
-   se aborta solo ese lote y se puede continuar con el siguiente.
-   ===================================================================== */
-
--- ---------------------------------------------------------------
--- PROBAR trg_actualizar_monto_factura
--- ---------------------------------------------------------------
--- Monto actual de la Factura 1
-SELECT Num_Factura, Monto FROM Factura WHERE Num_Factura = 1;
-GO
-
--- Insertar un nuevo detalle de $50 (2 unidades a $25)
-INSERT INTO Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (25.00, 2, 1, 1);
-GO
-
--- Verificar que el monto de la Factura 1 sumo esos $50 exactos
-SELECT Num_Factura, Monto FROM Factura WHERE Num_Factura = 1;
-GO
-
--- Borrar el detalle que acabamos de meter: el monto vuelve a bajar
-DELETE FROM Detalle_Factura WHERE ID_Item = 1 AND Cantidad = 2 AND Num_Factura = 1;
-GO
-
-SELECT Num_Factura, Monto FROM Factura WHERE Num_Factura = 1;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_verificar_alergia_medicamento
--- ---------------------------------------------------------------
--- Agregar 'Perro' a las precauciones del medicamento 12
-UPDATE Medicamento
-SET    Precauciones = 'Totalmente contraindicado para Perro'
-WHERE  ID_Medicamento = 12;
-GO
-
--- Intentar recetarlo al diagnostico 1 (pertenece al perro Max) -> DEBE DAR ERROR 50001
-INSERT INTO Tratamiento (Frecuencia, Dosis, Vigencia, Descripcion, ID_Diagnostico, ID_Medicamento)
-VALUES ('Cada 8 horas', '1 pastilla', '2026-12-31', 'Prueba de bloqueo por alergia', 1, 12);
-GO
-
--- Revertir cambios
-UPDATE Medicamento
-SET    Precauciones = 'No administrar a animales con historial de alergia a la penicilina.'
-WHERE  ID_Medicamento = 12;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_actualizar_inventario
--- ---------------------------------------------------------------
--- Stock actual del medicamento 13
-SELECT ID_Medicamento, Stock FROM Medicamento WHERE ID_Medicamento = 13;
-GO
-
--- Escenario A: compra exitosa (descuenta 5 unidades)
-INSERT INTO Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (15.00, 5, 1, 13);
-GO
-
--- Comprobar que el stock bajo
-SELECT ID_Medicamento, Stock FROM Medicamento WHERE ID_Medicamento = 13;
-GO
-
--- Escenario B: intento de compra masiva sin stock -> DEBE DAR ERROR 50002
-INSERT INTO Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (15.00, 5000, 1, 13);
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_actualizacion_citas
--- ---------------------------------------------------------------
--- Insertar una cita con fecha pasada pero con estado 'Programada'
-INSERT INTO Cita (Fecha, Hora, Consultorio, Estado, ID_Mascota, ID_Veterinario)
-VALUES ('2023-01-01', '10:00:00', 'Consultorio X', 'Programada', 1, 1);
-GO
-
--- Verificar que el trigger la dejo como 'Cancelada'
-SELECT TOP (1) ID_Cita, Fecha, Estado
-FROM   Cita
-ORDER BY ID_Cita DESC;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_seguridad_facturacion
--- ---------------------------------------------------------------
--- La cita 11 es de la mascota 11 (Copito), cuyo duenio es el propietario 10 y
--- todavia no tiene factura. Intentar facturarla al propietario 99 -> DEBE DAR ERROR 50003.
--- (En la version Postgres se usaba la cita 1; aqui se usa una cita sin factura porque en
---  SQL Server la restriccion UNIQUE(ID_Cita) se evalua antes que el trigger AFTER.)
-INSERT INTO Factura (Fecha, Monto, ID_Cita, ID_Propietario)
-VALUES ('2026-06-19', 0, 11, 99);
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_procesar_pago_estado
--- ---------------------------------------------------------------
-DECLARE @hoy DATE = CAST(GETDATE() AS DATE);
-
--- Crear una cita nueva (a futuro, para que no sea cancelada por vencida)
-INSERT INTO Cita (Fecha, Hora, Consultorio, Estado, ID_Mascota, ID_Veterinario)
-VALUES (DATEADD(DAY, 7, @hoy), '12:00:00', 'Consultorio B', 'Programada', 1, 1);
-
--- Crear su factura correspondiente (monto inicia en 0)
-INSERT INTO Factura (Fecha, Monto, ID_Cita, ID_Propietario)
-VALUES (@hoy, 0, (SELECT MAX(ID_Cita) FROM Cita), 1);
-
--- Cargarle una "Esterilizacion felina" que cuesta $160
-INSERT INTO Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (160.00, 1, (SELECT MAX(Num_Factura) FROM Factura), 24);
-
--- El cliente pasa a caja pero solo abona $50 en efectivo
-INSERT INTO Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (50.00, 'Efectivo', (SELECT MAX(Num_Factura) FROM Factura));
-GO
-
--- Resultado esperado: Estado_Pago = 'Parcial' y estado de la cita = 'Completada'
-SELECT f.Num_Factura,
-       f.Monto AS total_a_pagar,
-       SUM(p.Monto) AS total_abonado,
-       f.Estado_Pago,
-       c.Estado AS estado_cita
-FROM   Factura f
-LEFT JOIN Pago p ON f.Num_Factura = p.Num_Factura
-JOIN   Cita c    ON f.ID_Cita     = c.ID_Cita
-WHERE  f.Num_Factura = (SELECT MAX(Num_Factura) FROM Factura)
-GROUP BY f.Num_Factura, f.Monto, f.Estado_Pago, c.Estado;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_validar_sobrepago (continua con la factura de la prueba anterior:
--- total $160, abonados $50)
--- ---------------------------------------------------------------
--- Intentar abonar $200 -> DEBE DAR ERROR 50004 (50 + 200 > 160)
-INSERT INTO Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (200.00, 'Tarjeta', (SELECT MAX(Num_Factura) FROM Factura));
-GO
-
--- Segundo abono valido de $60 -> sigue 'Parcial' (110 de 160)
-INSERT INTO Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (60.00, 'Transferencia', (SELECT MAX(Num_Factura) FROM Factura));
-GO
-
--- Estado de cuenta: abonado 110, saldo pendiente 50, 2 abonos
-SELECT * FROM dbo.vw_estado_cuenta_factura
-WHERE  Num_Factura = (SELECT MAX(Num_Factura) FROM Factura);
-GO
-
--- Historial de abonos con acumulado y saldo despues de cada uno
-SELECT * FROM dbo.vw_historial_abonos
-WHERE  Num_Factura = (SELECT MAX(Num_Factura) FROM Factura)
-ORDER BY Fecha_Pago, ID_Pago;
-GO
-
--- Abono final de $50 -> la factura pasa a 'Pagado'
-INSERT INTO Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (50.00, 'Efectivo', (SELECT MAX(Num_Factura) FROM Factura));
-GO
-
-SELECT * FROM dbo.vw_estado_cuenta_factura
-WHERE  Num_Factura = (SELECT MAX(Num_Factura) FROM Factura);
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR el procedimiento almacenado
--- ---------------------------------------------------------------
-EXEC dbo.citas_completadas_portiempo_vencido;
+-- Historial de abonos: una fila por pago, con acumulado y saldo despues de cada abono
+CREATE OR ALTER VIEW facturacion.vw_historial_abonos
+AS
+SELECT p.Num_Factura,
+       pr.Nombre                                                AS Propietario,
+       p.ID_Pago,
+       p.Fecha_Pago,
+       p.Metodo_Pago,
+       p.Monto                                                  AS Abono,
+       SUM(p.Monto) OVER (PARTITION BY p.Num_Factura
+                          ORDER BY p.Fecha_Pago, p.ID_Pago
+                          ROWS UNBOUNDED PRECEDING)             AS Acumulado,
+       f.Monto - SUM(p.Monto) OVER (PARTITION BY p.Num_Factura
+                          ORDER BY p.Fecha_Pago, p.ID_Pago
+                          ROWS UNBOUNDED PRECEDING)             AS Saldo_Despues
+FROM   facturacion.Pago p
+JOIN   facturacion.Factura f      ON f.Num_Factura    = p.Num_Factura
+JOIN   clientes.Propietario pr ON pr.ID_Propietario = f.ID_Propietario;
 GO
