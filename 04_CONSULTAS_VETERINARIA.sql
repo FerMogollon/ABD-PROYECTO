@@ -1,369 +1,356 @@
-﻿/* =====================================================================
-   VETERINARIA - CONSULTAS Y PRUEBAS (SQL Server 2025)
-   Migrado desde PostgreSQL.
+/* =====================================================================
+   VETERINARIA - 3 CONSULTAS CON FUNCIONES VENTANA: ANTES vs DESPUES
+ 
+   CONSULTAS
+   1) Ingresos por veterinario y mes (gerencial)
+      Ventanas: RANK, LAG, SUM acumulado, SUM por mes (% del mes)
+      Indice DESPUES: IX_Cita_Fecha
+   2) Cartera pendiente de cobro por propietario (cobranza)
+      Ventanas: DENSE_RANK, SUM acumulado, SUM por propietario, SUM total (% cartera)
+      Indices DESPUES: IX_Factura_Fecha + IX_Pago_Factura
+   3) Ficha de visitas de las mascotas de un propietario (clinica)
+      Ventanas: ROW_NUMBER, LAG, SUM acumulado
+      Indices DESPUES: IX_Cita_Mascota_Fecha + IX_Diagnostico_Cita
 
-   Equivalencias usadas:
-   - LIMIT n                          -> SELECT TOP (n)
-   - current_date                     -> CAST(GETDATE() AS DATE)
-   - extract(month/year ...)          -> rangos de fechas (aprovechan indices)
-   - interval '6 months'              -> DATEADD(MONTH, -6, ...)
-   - string_agg(x, ', ' order by x)   -> STRING_AGG(x, ', ') WITHIN GROUP (ORDER BY x)
-   - || (concatenar)                  -> CONCAT()
-   - GROUP BY por alias               -> GROUP BY por columna (T-SQL no permite alias)
    ===================================================================== */
-
 USE Veterinaria;
 GO
-
+SET NOCOUNT ON;
+GO
+ 
 /* =====================================================================
-   A) CONSULTAS DEL PROYECTO
+   CONSULTA 1: INGRESOS POR VETERINARIO Y MES
    ===================================================================== */
+ 
+-- Estado "ANTES": sin los indices 
+DROP INDEX IF EXISTS IX_Cita_Fecha         ON clinica.Cita;
+DROP INDEX IF EXISTS IX_Cita_Mascota_Fecha ON clinica.Cita;
+DROP INDEX IF EXISTS IX_Factura_Fecha      ON facturacion.Factura;
+DROP INDEX IF EXISTS IX_Pago_Factura       ON facturacion.Pago;
+DROP INDEX IF EXISTS IX_Diagnostico_Cita   ON clinica.Diagnostico;
+GO
+UPDATE STATISTICS clinica.Cita        WITH FULLSCAN;
+UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
+CHECKPOINT;
+DBCC DROPCLEANBUFFERS;
+ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
+GO
+ 
+-- CONSULTA 1 - ANTES
+DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+ 
+WITH IngresosMes AS (
+    SELECT c.ID_Veterinario,
+           DATEFROMPARTS(YEAR(c.Fecha), MONTH(c.Fecha), 1) AS Mes,
+           COUNT(*)     AS Facturas,
+           SUM(f.Monto) AS Ingresos
+    FROM   clinica.Cita c
+    JOIN   facturacion.Factura f ON f.ID_Cita = c.ID_Cita
+    WHERE  c.Fecha >= @Desde AND c.Fecha < @Hasta
+      AND  c.Estado = 'Completada'
+    GROUP BY c.ID_Veterinario, DATEFROMPARTS(YEAR(c.Fecha), MONTH(c.Fecha), 1)
+)
+SELECT v.Nombre AS Veterinario, im.Mes, im.Facturas, im.Ingresos,
+       RANK() OVER (PARTITION BY im.Mes ORDER BY im.Ingresos DESC)                         AS Ranking_Mes,
+       LAG(im.Ingresos) OVER (PARTITION BY im.ID_Veterinario ORDER BY im.Mes)              AS Ingresos_Mes_Anterior,
+       im.Ingresos - LAG(im.Ingresos) OVER (PARTITION BY im.ID_Veterinario ORDER BY im.Mes) AS Variacion,
+       SUM(im.Ingresos) OVER (PARTITION BY im.ID_Veterinario ORDER BY im.Mes
+                              ROWS UNBOUNDED PRECEDING)                                    AS Acumulado,
+       CAST(100.0 * im.Ingresos / SUM(im.Ingresos) OVER (PARTITION BY im.Mes) AS DECIMAL(5,1)) AS Pct_del_Mes
+FROM   IngresosMes im
+JOIN   clinica.Veterinario v ON v.ID_Veterinario = im.ID_Veterinario
+ORDER BY im.Mes, Ranking_Mes
+OPTION (RECOMPILE);
+ 
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
+GO
+ 
+-- Estado "DESPUES": crear indice
+CREATE INDEX IX_Cita_Fecha ON clinica.Cita (Fecha) INCLUDE (ID_Veterinario, Estado);
+GO
+UPDATE STATISTICS clinica.Cita WITH FULLSCAN;
+CHECKPOINT;
+DBCC DROPCLEANBUFFERS;
+ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
+GO
+ 
+-- CONSULTA 1 - DESPUES 
+DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+ 
+WITH IngresosMes AS (
+    SELECT c.ID_Veterinario,
+           DATEFROMPARTS(YEAR(c.Fecha), MONTH(c.Fecha), 1) AS Mes,
+           COUNT(*)     AS Facturas,
+           SUM(f.Monto) AS Ingresos
+    FROM   clinica.Cita c
+    JOIN   facturacion.Factura f ON f.ID_Cita = c.ID_Cita
+    WHERE  c.Fecha >= @Desde AND c.Fecha < @Hasta
+      AND  c.Estado = 'Completada'
+    GROUP BY c.ID_Veterinario, DATEFROMPARTS(YEAR(c.Fecha), MONTH(c.Fecha), 1)
+)
+SELECT v.Nombre AS Veterinario, im.Mes, im.Facturas, im.Ingresos,
+       RANK() OVER (PARTITION BY im.Mes ORDER BY im.Ingresos DESC)                         AS Ranking_Mes,
+       LAG(im.Ingresos) OVER (PARTITION BY im.ID_Veterinario ORDER BY im.Mes)              AS Ingresos_Mes_Anterior,
+       im.Ingresos - LAG(im.Ingresos) OVER (PARTITION BY im.ID_Veterinario ORDER BY im.Mes) AS Variacion,
+       SUM(im.Ingresos) OVER (PARTITION BY im.ID_Veterinario ORDER BY im.Mes
+                              ROWS UNBOUNDED PRECEDING)                                    AS Acumulado,
+       CAST(100.0 * im.Ingresos / SUM(im.Ingresos) OVER (PARTITION BY im.Mes) AS DECIMAL(5,1)) AS Pct_del_Mes
+FROM   IngresosMes im
+JOIN   clinica.Veterinario v ON v.ID_Veterinario = im.ID_Veterinario
+ORDER BY im.Mes, Ranking_Mes
+OPTION (RECOMPILE);
+ 
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
+GO
+ 
+ 
+/* =====================================================================
+   CONSULTA 2: CARTERA PENDIENTE DE COBRO POR PROPIETARIO
+   (facturas emitidas en el rango con saldo = Monto - suma de pagos)
+   ===================================================================== */
+ 
+-- Estado "ANTES": sin los indices
+DROP INDEX IF EXISTS IX_Cita_Fecha         ON clinica.Cita;
+DROP INDEX IF EXISTS IX_Cita_Mascota_Fecha ON clinica.Cita;
+DROP INDEX IF EXISTS IX_Factura_Fecha      ON facturacion.Factura;
+DROP INDEX IF EXISTS IX_Pago_Factura       ON facturacion.Pago;
+DROP INDEX IF EXISTS IX_Diagnostico_Cita   ON clinica.Diagnostico;
+GO
+UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
+UPDATE STATISTICS facturacion.Pago    WITH FULLSCAN;
+CHECKPOINT;
+DBCC DROPCLEANBUFFERS;
+ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
+GO
+ 
+-- CONSULTA 2 - ANTES
+DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+ 
+WITH Saldos AS (
+    SELECT f.Num_Factura, f.ID_Propietario, f.Fecha, f.Estado_Pago, f.Monto,
+           ISNULL(pg.Pagado, 0)           AS Pagado,
+           f.Monto - ISNULL(pg.Pagado, 0) AS Saldo
+    FROM   facturacion.Factura f
+    OUTER APPLY (SELECT SUM(p.Monto) AS Pagado
+                 FROM   facturacion.Pago p
+                 WHERE  p.Num_Factura = f.Num_Factura) pg
+    WHERE  f.Fecha >= @Desde AND f.Fecha < @Hasta
+),
+Pendientes AS (
+    SELECT *, SUM(Saldo) OVER (PARTITION BY ID_Propietario) AS Deuda_Propietario
+    FROM   Saldos
+    WHERE  Saldo > 0
+)
+SELECT pr.Nombre AS Propietario, pe.Num_Factura, pe.Fecha, pe.Estado_Pago,
+       pe.Monto, pe.Pagado, pe.Saldo, pe.Deuda_Propietario,
+       DENSE_RANK() OVER (ORDER BY pe.Deuda_Propietario DESC)                          AS Ranking_Deudor,
+       SUM(pe.Saldo) OVER (PARTITION BY pe.ID_Propietario
+                           ORDER BY pe.Fecha, pe.Num_Factura ROWS UNBOUNDED PRECEDING) AS Saldo_Acumulado,
+       CAST(100.0 * pe.Saldo / SUM(pe.Saldo) OVER () AS DECIMAL(5,1))                  AS Pct_Cartera,
+       DATEDIFF(DAY, pe.Fecha, CAST(GETDATE() AS DATE))                                AS Dias_Antiguedad
+FROM   Pendientes pe
+JOIN   clientes.Propietario pr ON pr.ID_Propietario = pe.ID_Propietario
+ORDER BY Ranking_Deudor, pe.Fecha, pe.Num_Factura
+OPTION (RECOMPILE);
+ 
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
+GO
+ 
+-- Estado "DESPUES": crear indices
+CREATE INDEX IX_Factura_Fecha ON facturacion.Factura (Fecha) INCLUDE (ID_Propietario, Estado_Pago, Monto);
+CREATE INDEX IX_Pago_Factura  ON facturacion.Pago (Num_Factura) INCLUDE (Monto);   -- la FK no tenia indice
+GO
+UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
+UPDATE STATISTICS facturacion.Pago    WITH FULLSCAN;
+CHECKPOINT;
+DBCC DROPCLEANBUFFERS;
+ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
+GO
+ 
+-- CONSULTA 2 - DESPUES 
+DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+ 
+WITH Saldos AS (
+    SELECT f.Num_Factura, f.ID_Propietario, f.Fecha, f.Estado_Pago, f.Monto,
+           ISNULL(pg.Pagado, 0)           AS Pagado,
+           f.Monto - ISNULL(pg.Pagado, 0) AS Saldo
+    FROM   facturacion.Factura f
+    OUTER APPLY (SELECT SUM(p.Monto) AS Pagado
+                 FROM   facturacion.Pago p
+                 WHERE  p.Num_Factura = f.Num_Factura) pg
+    WHERE  f.Fecha >= @Desde AND f.Fecha < @Hasta
+),
+Pendientes AS (
+    SELECT *, SUM(Saldo) OVER (PARTITION BY ID_Propietario) AS Deuda_Propietario
+    FROM   Saldos
+    WHERE  Saldo > 0
+)
+SELECT pr.Nombre AS Propietario, pe.Num_Factura, pe.Fecha, pe.Estado_Pago,
+       pe.Monto, pe.Pagado, pe.Saldo, pe.Deuda_Propietario,
+       DENSE_RANK() OVER (ORDER BY pe.Deuda_Propietario DESC)                          AS Ranking_Deudor,
+       SUM(pe.Saldo) OVER (PARTITION BY pe.ID_Propietario
+                           ORDER BY pe.Fecha, pe.Num_Factura ROWS UNBOUNDED PRECEDING) AS Saldo_Acumulado,
+       CAST(100.0 * pe.Saldo / SUM(pe.Saldo) OVER () AS DECIMAL(5,1))                  AS Pct_Cartera,
+       DATEDIFF(DAY, pe.Fecha, CAST(GETDATE() AS DATE))                                AS Dias_Antiguedad
+FROM   Pendientes pe
+JOIN   clientes.Propietario pr ON pr.ID_Propietario = pe.ID_Propietario
+ORDER BY Ranking_Deudor, pe.Fecha, pe.Num_Factura
+OPTION (RECOMPILE);
+ 
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
+GO
+ 
+ 
+/* =====================================================================
+   CONSULTA 3: FICHA DE VISITAS DE LAS MASCOTAS DE UN PROPIETARIO
+   (el propietario se elige solo: el que mas visitas no canceladas tiene)
+   ===================================================================== */
+ 
+-- Estado "ANTES": sin los indices
+DROP INDEX IF EXISTS IX_Cita_Fecha         ON clinica.Cita;
+DROP INDEX IF EXISTS IX_Cita_Mascota_Fecha ON clinica.Cita;
+DROP INDEX IF EXISTS IX_Factura_Fecha      ON facturacion.Factura;
+DROP INDEX IF EXISTS IX_Pago_Factura       ON facturacion.Pago;
+DROP INDEX IF EXISTS IX_Diagnostico_Cita   ON clinica.Diagnostico;
+GO
+UPDATE STATISTICS clinica.Cita        WITH FULLSCAN;
+UPDATE STATISTICS clientes.Mascota    WITH FULLSCAN;
+UPDATE STATISTICS clinica.Diagnostico WITH FULLSCAN;
+UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
+CHECKPOINT;
+DBCC DROPCLEANBUFFERS;
+ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
+GO
+ 
+-- CONSULTA 3 - ANTES
 
--- 1. Mascotas mas atendidas en el mes y anio actuales
-SELECT TOP (5)
-       m.Nombre AS mascota,
-       COUNT(c.ID_Mascota) AS veces_atendido
+DECLARE @ID_Propietario BIGINT = (
+    SELECT TOP 1 m.ID_Propietario
+    FROM   clinica.Cita c
+    JOIN   clientes.Mascota m ON m.ID_Mascota = c.ID_Mascota
+    WHERE  c.Estado <> 'Cancelada'
+    GROUP BY m.ID_Propietario
+    ORDER BY COUNT(*) DESC, m.ID_Propietario);
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+ 
+SELECT pr.Nombre AS Propietario, m.Nombre AS Mascota, m.Especie,
+       c.Fecha, c.Estado, dg.Diagnosticos, f.Monto,
+       ROW_NUMBER() OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora) AS Nro_Visita,
+       DATEDIFF(DAY, LAG(c.Fecha) OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora), c.Fecha) AS Dias_Desde_Anterior,
+       SUM(f.Monto) OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora
+                          ROWS UNBOUNDED PRECEDING)                           AS Gasto_Acumulado
 FROM   clientes.Mascota m
-JOIN   clinica.Cita c ON m.ID_Mascota = c.ID_Mascota
-WHERE  c.Fecha >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
-  AND  c.Fecha <  DATEADD(MONTH, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
-GROUP BY m.ID_Mascota, m.Nombre
-ORDER BY COUNT(c.ID_Mascota) DESC;
+JOIN   clientes.Propietario pr ON pr.ID_Propietario = m.ID_Propietario
+JOIN   clinica.Cita c          ON c.ID_Mascota      = m.ID_Mascota
+OUTER APPLY (SELECT STRING_AGG(d.Descripcion, '; ') AS Diagnosticos   -- una cita puede tener varios diagnosticos
+             FROM   clinica.Diagnostico d
+             WHERE  d.ID_Cita = c.ID_Cita) dg
+LEFT JOIN facturacion.Factura f ON f.ID_Cita = c.ID_Cita
+WHERE  m.ID_Propietario = @ID_Propietario
+  AND  c.Estado <> 'Cancelada'
+ORDER BY m.Nombre, Nro_Visita
+OPTION (RECOMPILE);
+ 
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
 GO
-
--- 2. Veterinarios ordenados segun el mayor numero de citas en el segundo trimestre del anio actual
-SELECT v.Nombre AS veterinario,
-       COUNT(c.ID_Cita) AS numero_citas
-FROM   clinica.Veterinario v
-JOIN   clinica.Cita c ON v.ID_Veterinario = c.ID_Veterinario
-WHERE  c.Fecha >= DATEFROMPARTS(YEAR(GETDATE()), 4, 1)
-  AND  c.Fecha <  DATEFROMPARTS(YEAR(GETDATE()), 7, 1)
-GROUP BY v.ID_Veterinario, v.Nombre
-ORDER BY numero_citas DESC;
+ 
+-- Estado "DESPUES": crear indices
+CREATE INDEX IX_Cita_Mascota_Fecha ON clinica.Cita (ID_Mascota, Fecha, Hora) INCLUDE (Estado);
+CREATE INDEX IX_Diagnostico_Cita   ON clinica.Diagnostico (ID_Cita) INCLUDE (Descripcion);   -- la FK no tenia indice
 GO
-
--- 3. Medicamentos prescritos con mayor frecuencia
-SELECT TOP (3)
-       i.Descripcion AS medicamento,
-       COUNT(t.ID_Medicamento) AS veces_prescrito
-FROM   catalogo.Medicamento m
-JOIN   clinica.Tratamiento t       ON m.ID_Medicamento = t.ID_Medicamento
-JOIN   catalogo.Item_Facturable i   ON m.ID_Medicamento = i.ID_Item
-GROUP BY m.ID_Medicamento, i.Descripcion
-ORDER BY veces_prescrito DESC;
+UPDATE STATISTICS clinica.Cita        WITH FULLSCAN;
+UPDATE STATISTICS clinica.Diagnostico WITH FULLSCAN;
+CHECKPOINT;
+DBCC DROPCLEANBUFFERS;
+ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
 GO
-
--- 4. Ingresos totales por especialidad veterinaria
-SELECT e.Nombre AS especialidad,
-       SUM(f.Monto) AS ingresos_totales
-FROM   clinica.Especialidad e
-JOIN   clinica.Veterinario_Especialidad ve ON e.ID_Especialidad = ve.ID_Especialidad
-JOIN   clinica.Veterinario v               ON ve.ID_Veterinario = v.ID_Veterinario
-JOIN   clinica.Cita c                      ON v.ID_Veterinario  = c.ID_Veterinario
-JOIN   facturacion.Factura f                   ON c.ID_Cita         = f.ID_Cita
-GROUP BY e.ID_Especialidad, e.Nombre
-ORDER BY ingresos_totales DESC;
+ 
+-- CONSULTA 3 - DESPUES 
+DECLARE @ID_Propietario BIGINT = (
+    SELECT TOP 1 m.ID_Propietario
+    FROM   clinica.Cita c
+    JOIN   clientes.Mascota m ON m.ID_Mascota = c.ID_Mascota
+    WHERE  c.Estado <> 'Cancelada'
+    GROUP BY m.ID_Propietario
+    ORDER BY COUNT(*) DESC, m.ID_Propietario);
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+ 
+SELECT pr.Nombre AS Propietario, m.Nombre AS Mascota, m.Especie,
+       c.Fecha, c.Estado, dg.Diagnosticos, f.Monto,
+       ROW_NUMBER() OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora) AS Nro_Visita,
+       DATEDIFF(DAY, LAG(c.Fecha) OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora), c.Fecha) AS Dias_Desde_Anterior,
+       SUM(f.Monto) OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora
+                          ROWS UNBOUNDED PRECEDING)                           AS Gasto_Acumulado
+FROM   clientes.Mascota m
+JOIN   clientes.Propietario pr ON pr.ID_Propietario = m.ID_Propietario
+JOIN   clinica.Cita c          ON c.ID_Mascota      = m.ID_Mascota
+OUTER APPLY (SELECT STRING_AGG(d.Descripcion, '; ') AS Diagnosticos
+             FROM   clinica.Diagnostico d
+             WHERE  d.ID_Cita = c.ID_Cita) dg
+LEFT JOIN facturacion.Factura f ON f.ID_Cita = c.ID_Cita
+WHERE  m.ID_Propietario = @ID_Propietario
+  AND  c.Estado <> 'Cancelada'
+ORDER BY m.Nombre, Nro_Visita
+OPTION (RECOMPILE);
+ 
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
 GO
-
--- 5. Propietarios con mascotas que han asistido a citas en los ultimos 6 meses
-SELECT DISTINCT
-       p.Nombre AS propietario,
-       m.Nombre AS mascota
-FROM   clientes.Propietario p
-JOIN   clientes.Mascota m ON p.ID_Propietario = m.ID_Propietario
-JOIN   clinica.Cita c    ON m.ID_Mascota     = c.ID_Mascota
-WHERE  c.Fecha >= DATEADD(MONTH, -6, CAST(GETDATE() AS DATE))
-ORDER BY p.Nombre;
-GO
-
--- 6. Propietarios con mas de una mascota
-SELECT p.Nombre AS propietario,
-       STRING_AGG(m.Nombre, ', ') WITHIN GROUP (ORDER BY m.Nombre) AS mascotas,
-       COUNT(m.ID_Mascota) AS cantidad_mascotas
-FROM   clientes.Propietario p
-JOIN   clientes.Mascota m ON p.ID_Propietario = m.ID_Propietario
-GROUP BY p.ID_Propietario, p.Nombre   -- se agrupa tambien por ID para no mezclar homonimos
-HAVING COUNT(m.ID_Mascota) > 1
-ORDER BY cantidad_mascotas DESC;
-GO
-
-
+ 
+ 
 /* =====================================================================
-   B) CONSULTAS DE VERIFICACION / PRUEBA
+   INDICES CREADOS PARA LAS CONSULTAS 1, 2 Y 3
    ===================================================================== */
-
--- Ver que los montos coincidan en las facturas
-/*
-SELECT f.Num_Factura,
-       f.Monto AS monto_guardado,
-       COALESCE(SUM(df.Precio_Unitario * df.Cantidad), 0) AS monto_calculado
-FROM   facturacion.Factura f
-LEFT JOIN facturacion.Detalle_Factura df ON f.Num_Factura = df.Num_Factura
-GROUP BY f.Num_Factura, f.Monto
-HAVING f.Monto <> COALESCE(SUM(df.Precio_Unitario * df.Cantidad), 0);
-*/
-
--- Confirmar que los IDs de las facturas coincidan con los propietarios de las mascotas
-SELECT f.Num_Factura,
-       f.ID_Cita,
-       c.ID_Mascota,
-       m.ID_Propietario AS propietario_correcto,
-       f.ID_Propietario AS propietario_en_factura
-FROM   facturacion.Factura f
-JOIN   clinica.Cita c    ON f.ID_Cita    = c.ID_Cita
-JOIN   clientes.Mascota m ON c.ID_Mascota = m.ID_Mascota
-WHERE  f.ID_Propietario <> m.ID_Propietario;
+CREATE INDEX IX_Cita_Fecha ON clinica.Cita (Fecha) INCLUDE (ID_Veterinario, Estado);
+CREATE INDEX IX_Factura_Fecha ON facturacion.Factura (Fecha) INCLUDE (ID_Propietario, Estado_Pago, Monto);
+CREATE INDEX IX_Pago_Factura  ON facturacion.Pago (Num_Factura) INCLUDE (Monto);
+CREATE INDEX IX_Cita_Mascota_Fecha ON clinica.Cita (ID_Mascota, Fecha, Hora) INCLUDE (Estado);
+CREATE INDEX IX_Diagnostico_Cita   ON clinica.Diagnostico (ID_Cita) INCLUDE (Descripcion); 
 GO
-
--- Revisar que todos los diagnosticos de los tratamientos existan
-/*
-SELECT *
-FROM   clinica.Tratamiento t
-LEFT JOIN clinica.Diagnostico d ON t.ID_Diagnostico = d.ID_Diagnostico
-WHERE  d.ID_Diagnostico IS NULL;
-*/
-
--- Revisar que todos los diagnosticos tengan procedimientos validos
-/*
-SELECT *
-FROM   clinica.Diagnostico_Procedimiento dp
-LEFT JOIN catalogo.Procedimiento p ON dp.ID_Procedimiento = p.ID_Procedimiento
-WHERE  p.ID_Procedimiento IS NULL;
-*/
-
--- Verificar que los precios coincidan con el costo del item
-/*
-SELECT df.Num_Factura, df.ID_Item, df.Precio_Unitario, i.Costo
-FROM   facturacion.Detalle_Factura df
-JOIN   catalogo.Item_Facturable i ON df.ID_Item = i.ID_Item
-WHERE  df.Precio_Unitario <> i.Costo;
-
-SELECT ID_Item, Descripcion, Costo FROM catalogo.Item_Facturable ORDER BY ID_Item;
-SELECT ID_Item, Cantidad, Precio_Unitario, ID_Detalle FROM facturacion.Detalle_Factura ORDER BY ID_Item;
-*/
-
--- Revisar las facturas (detalle concatenado por factura)
-/*
-SELECT f.Num_Factura,
-       f.Fecha,
-       p.Nombre AS propietario,
-       m.Nombre AS mascota,
-       STRING_AGG(CONCAT(i.Descripcion, ' (x', df.Cantidad, ', $', df.Precio_Unitario, ')'), ' | ')
-           WITHIN GROUP (ORDER BY df.ID_Detalle) AS detalles,
-       f.Monto
-FROM   facturacion.Factura f
-JOIN   clinica.Cita c               ON f.ID_Cita     = c.ID_Cita
-JOIN   clientes.Mascota m            ON c.ID_Mascota  = m.ID_Mascota
-JOIN   clientes.Propietario p        ON m.ID_Propietario = p.ID_Propietario
-JOIN   facturacion.Detalle_Factura df   ON f.Num_Factura = df.Num_Factura
-JOIN   catalogo.Item_Facturable i    ON df.ID_Item    = i.ID_Item
-GROUP BY f.Num_Factura, f.Fecha, p.Nombre, m.Nombre, f.Monto
-ORDER BY f.Num_Factura;
-*/
-
-
+ 
+ 
 /* =====================================================================
-   C) CORRECCIONES DE DATOS (estaban en el archivo original de consultas)
-   Se ejecutan una sola vez, despues de cargar el DML.
+   COSTO DE LOS INDICES 
    ===================================================================== */
-
--- Actualizar ciertas facturas
-UPDATE facturacion.Factura SET ID_Propietario = 13 WHERE ID_Cita = 15;
-UPDATE facturacion.Factura SET ID_Propietario = 2  WHERE ID_Cita = 13;
-UPDATE facturacion.Factura SET ID_Propietario = 12 WHERE ID_Cita = 14;
+SELECT OBJECT_SCHEMA_NAME(i.object_id) + '.' + OBJECT_NAME(i.object_id) AS Tabla,
+       i.name                  AS Indice,
+       i.type_desc             AS Tipo,
+       SUM(ps.used_page_count) AS Paginas,
+       SUM(ps.used_page_count) * 8 AS KB,
+       SUM(ps.row_count)       AS Filas
+FROM   sys.indexes i
+JOIN   sys.dm_db_partition_stats ps
+       ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+WHERE  i.object_id IN (OBJECT_ID(N'clinica.Cita'), OBJECT_ID(N'clinica.Diagnostico'),
+                       OBJECT_ID(N'facturacion.Factura'), OBJECT_ID(N'facturacion.Pago'))
+GROUP BY i.object_id, i.name, i.type_desc
+ORDER BY Tabla, i.type_desc, i.name;
 GO
-
--- Esta da error a proposito: valida el trigger trg_seguridad_facturacion
--- (la cita 13 pertenece al propietario 2, no al 13)
--- UPDATE facturacion.Factura SET ID_Propietario = 13 WHERE ID_Cita = 13;
-
--- Alinear precios del detalle con el costo del item
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 12  WHERE ID_Item = 12;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 12  WHERE ID_Item = 1;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 15  WHERE ID_Item = 10;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 22  WHERE ID_Item = 11;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 18  WHERE ID_Item = 13;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 20  WHERE ID_Item = 15;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 9   WHERE ID_Item = 18;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 15  WHERE ID_Item = 22;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 350 WHERE ID_Item = 29;
-UPDATE facturacion.Detalle_Factura SET Precio_Unitario = 30  WHERE ID_Item = 33;
+ 
+/* =========================================================================
+   USO DE LOS INDICES DESDE EL ULTIMO REINICIO DEL SERVIDOR
+   
+   ========================================================================= */
+SELECT i.name AS Indice, us.user_seeks, us.user_scans, us.user_lookups, us.user_updates
+FROM   sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats us
+       ON us.object_id = i.object_id AND us.index_id = i.index_id AND us.database_id = DB_ID()
+WHERE  i.name IN (N'IX_Cita_Fecha', N'IX_Cita_Mascota_Fecha', N'IX_Factura_Fecha',
+                  N'IX_Pago_Factura', N'IX_Diagnostico_Cita');
 GO
-
-
-/* =====================================================================
-   D) PRUEBAS DE TRIGGERS
-   Cada prueba va en su propio lote (GO): cuando un trigger lanza error,
-   se aborta solo ese lote y se puede continuar con el siguiente.
-   ===================================================================== */
-
--- ---------------------------------------------------------------
--- PROBAR trg_actualizar_monto_factura
--- ---------------------------------------------------------------
--- Monto actual de la Factura 1
-SELECT Num_Factura, Monto FROM facturacion.Factura WHERE Num_Factura = 1;
-GO
-
--- Insertar un nuevo detalle de $50 (2 unidades a $25)
-INSERT INTO facturacion.Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (25.00, 2, 1, 1);
-GO
-
--- Verificar que el monto de la Factura 1 sumo esos $50 exactos
-SELECT Num_Factura, Monto FROM facturacion.Factura WHERE Num_Factura = 1;
-GO
-
--- Borrar el detalle que acabamos de meter: el monto vuelve a bajar
-DELETE FROM facturacion.Detalle_Factura WHERE ID_Item = 1 AND Cantidad = 2 AND Num_Factura = 1;
-GO
-
-SELECT Num_Factura, Monto FROM facturacion.Factura WHERE Num_Factura = 1;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_verificar_alergia_medicamento
--- ---------------------------------------------------------------
--- Agregar 'Perro' a las precauciones del medicamento 12
-UPDATE catalogo.Medicamento
-SET    Precauciones = 'Totalmente contraindicado para Perro'
-WHERE  ID_Medicamento = 12;
-GO
-
--- Intentar recetarlo al diagnostico 1 (pertenece al perro Max) -> DEBE DAR ERROR 50001
-INSERT INTO clinica.Tratamiento (Frecuencia, Dosis, Vigencia, Descripcion, ID_Diagnostico, ID_Medicamento)
-VALUES ('Cada 8 horas', '1 pastilla', '2026-12-31', 'Prueba de bloqueo por alergia', 1, 12);
-GO
-
--- Revertir cambios
-UPDATE catalogo.Medicamento
-SET    Precauciones = 'No administrar a animales con historial de alergia a la penicilina.'
-WHERE  ID_Medicamento = 12;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_actualizar_inventario
--- ---------------------------------------------------------------
--- Stock actual del medicamento 13
-SELECT ID_Medicamento, Stock FROM catalogo.Medicamento WHERE ID_Medicamento = 13;
-GO
-
--- Escenario A: compra exitosa (descuenta 5 unidades)
-INSERT INTO facturacion.Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (15.00, 5, 1, 13);
-GO
-
--- Comprobar que el stock bajo
-SELECT ID_Medicamento, Stock FROM catalogo.Medicamento WHERE ID_Medicamento = 13;
-GO
-
--- Escenario B: intento de compra masiva sin stock -> DEBE DAR ERROR 50002
-INSERT INTO facturacion.Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (15.00, 5000, 1, 13);
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_actualizacion_citas
--- ---------------------------------------------------------------
--- Insertar una cita con fecha pasada pero con estado 'Programada'
-INSERT INTO clinica.Cita (Fecha, Hora, Consultorio, Estado, ID_Mascota, ID_Veterinario)
-VALUES ('2023-01-01', '10:00:00', 'Consultorio X', 'Programada', 1, 1);
-GO
-
--- Verificar que el trigger la dejo como 'Cancelada'
-SELECT TOP (1) ID_Cita, Fecha, Estado
-FROM   clinica.Cita
-ORDER BY ID_Cita DESC;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_seguridad_facturacion
--- ---------------------------------------------------------------
--- La cita 11 es de la mascota 11 (Copito), cuyo duenio es el propietario 10 y
--- todavia no tiene factura. Intentar facturarla al propietario 99 -> DEBE DAR ERROR 50003.
--- (En la version Postgres se usaba la cita 1; aqui se usa una cita sin factura porque en
---  SQL Server la restriccion UNIQUE(ID_Cita) se evalua antes que el trigger AFTER.)
-INSERT INTO facturacion.Factura (Fecha, Monto, ID_Cita, ID_Propietario)
-VALUES ('2026-06-19', 0, 11, 99);
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_procesar_pago_estado
--- ---------------------------------------------------------------
-DECLARE @hoy DATE = CAST(GETDATE() AS DATE);
-
--- Crear una cita nueva (a futuro, para que no sea cancelada por vencida)
-INSERT INTO clinica.Cita (Fecha, Hora, Consultorio, Estado, ID_Mascota, ID_Veterinario)
-VALUES (DATEADD(DAY, 7, @hoy), '12:00:00', 'Consultorio B', 'Programada', 1, 1);
-
--- Crear su factura correspondiente (monto inicia en 0)
-INSERT INTO facturacion.Factura (Fecha, Monto, ID_Cita, ID_Propietario)
-VALUES (@hoy, 0, (SELECT MAX(ID_Cita) FROM clinica.Cita), 1);
-
--- Cargarle una "Esterilizacion felina" que cuesta $160
-INSERT INTO facturacion.Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
-VALUES (160.00, 1, (SELECT MAX(Num_Factura) FROM facturacion.Factura), 24);
-
--- El cliente pasa a caja pero solo abona $50 en efectivo
-INSERT INTO facturacion.Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (50.00, 'Efectivo', (SELECT MAX(Num_Factura) FROM facturacion.Factura));
-GO
-
--- Resultado esperado: Estado_Pago = 'Parcial' y estado de la cita = 'Completada'
-SELECT f.Num_Factura,
-       f.Monto AS total_a_pagar,
-       SUM(p.Monto) AS total_abonado,
-       f.Estado_Pago,
-       c.Estado AS estado_cita
-FROM   facturacion.Factura f
-LEFT JOIN facturacion.Pago p ON f.Num_Factura = p.Num_Factura
-JOIN   clinica.Cita c    ON f.ID_Cita     = c.ID_Cita
-WHERE  f.Num_Factura = (SELECT MAX(Num_Factura) FROM facturacion.Factura)
-GROUP BY f.Num_Factura, f.Monto, f.Estado_Pago, c.Estado;
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR trg_validar_sobrepago (continua con la factura de la prueba anterior:
--- total $160, abonados $50)
--- ---------------------------------------------------------------
--- Intentar abonar $200 -> DEBE DAR ERROR 50004 (50 + 200 > 160)
-INSERT INTO facturacion.Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (200.00, 'Tarjeta', (SELECT MAX(Num_Factura) FROM facturacion.Factura));
-GO
-
--- Segundo abono valido de $60 -> sigue 'Parcial' (110 de 160)
-INSERT INTO facturacion.Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (60.00, 'Transferencia', (SELECT MAX(Num_Factura) FROM facturacion.Factura));
-GO
-
--- Estado de cuenta: abonado 110, saldo pendiente 50, 2 abonos
-SELECT * FROM facturacion.vw_estado_cuenta_factura
-WHERE  Num_Factura = (SELECT MAX(Num_Factura) FROM facturacion.Factura);
-GO
-
--- Historial de abonos con acumulado y saldo despues de cada uno
-SELECT * FROM facturacion.vw_historial_abonos
-WHERE  Num_Factura = (SELECT MAX(Num_Factura) FROM facturacion.Factura)
-ORDER BY Fecha_Pago, ID_Pago;
-GO
-
--- Abono final de $50 -> la factura pasa a 'Pagado'
-INSERT INTO facturacion.Pago (Monto, Metodo_Pago, Num_Factura)
-VALUES (50.00, 'Efectivo', (SELECT MAX(Num_Factura) FROM facturacion.Factura));
-GO
-
-SELECT * FROM facturacion.vw_estado_cuenta_factura
-WHERE  Num_Factura = (SELECT MAX(Num_Factura) FROM facturacion.Factura);
-GO
-
-
--- ---------------------------------------------------------------
--- PROBAR el procedimiento almacenado
--- ---------------------------------------------------------------
-EXEC clinica.citas_completadas_portiempo_vencido;
-GO
+ 
