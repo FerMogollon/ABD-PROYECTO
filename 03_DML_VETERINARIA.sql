@@ -7,7 +7,7 @@
      - Fechas/horas de Cita normalizadas a 'YYYY-MM-DD' y 'HH:MM:SS'
      - Textos con acentos con prefijo N'...' (Unicode)
      - Bloque de PAGO: random()/array[] -> NEWID()/CHOOSE() con tabla temporal
-   ===================================================================== */
+    ===================================================================== */
 
 USE Veterinaria;
 GO
@@ -881,11 +881,22 @@ insert into clinica.diagnostico_procedimiento (id_procedimiento,id_diagnostico) 
 insert into clinica.diagnostico_procedimiento (id_procedimiento,id_diagnostico) values (29,13);
 insert into clinica.diagnostico_procedimiento (id_procedimiento,id_diagnostico) values (35,16);
 insert into clinica.diagnostico_procedimiento (id_procedimiento,id_diagnostico) values (28,17);
--- Nuevos datos agregados utilizando select
-insert into clinica.diagnostico_procedimiento (id_diagnostico, id_procedimiento)
-select id_diagnostico, 5
-from clinica.diagnostico
-where id_diagnostico between 18 and 118;
+-- Nuevos datos (VARIABLES): cada diagnostico recibe un procedimiento distinto.
+-- (v1 asignaba el procedimiento 5 al 100% de las filas.) El cuadrado modulo el total
+-- produce una distribucion NO uniforme: unos procedimientos son mas frecuentes que otros.
+-- ~80% de los diagnosticos llevan procedimiento (los multiplos de 5 no).
+;WITH proc_n AS (
+    SELECT ID_Procedimiento,
+           ROW_NUMBER() OVER (ORDER BY ID_Procedimiento) AS rn,
+           COUNT(*)     OVER ()                          AS total
+    FROM   catalogo.Procedimiento
+)
+INSERT INTO clinica.Diagnostico_Procedimiento (ID_Diagnostico, ID_Procedimiento)
+SELECT d.ID_Diagnostico, p.ID_Procedimiento
+FROM   clinica.Diagnostico d
+JOIN   proc_n p ON p.rn = 1 + ((d.ID_Diagnostico * d.ID_Diagnostico) % p.total)
+WHERE  d.ID_Diagnostico BETWEEN 18 AND 118
+  AND  d.ID_Diagnostico % 5 <> 0;
 --select * from clinica.diagnostico_procedimiento;
 
 
@@ -1081,52 +1092,298 @@ insert into facturacion.detalle_factura (precio_unitario,cantidad,num_factura,id
 insert into facturacion.detalle_factura (precio_unitario,cantidad,num_factura,id_item) values (20,1,13,1);
 insert into facturacion.detalle_factura (precio_unitario,cantidad,num_factura,id_item) values (90,1,13,22);
 insert into facturacion.detalle_factura (precio_unitario,cantidad,num_factura,id_item) values (12,1,13,11);
--- Nuevos datos utilizando select
-insert into facturacion.detalle_factura (precio_unitario, cantidad, num_factura, id_item)
-select
-    8, 1, num_factura, 5
-from facturacion.factura
-where num_factura between 14 and 114;
+-- Nuevos datos (VARIABLES): 1 a 3 lineas por factura, items y cantidades distintas.
+-- (v1 insertaba SIEMPRE la linea "Desparasitacion x1 = $8" en las 101 facturas.)
+-- Items de ID bajo (consultas, vacunas) son mas frecuentes que los caros (cirugias).
+-- Los aleatorios se materializan primero en tablas temporales (ver nota de NEWID en PAGO).
+SELECT Num_Factura, ABS(CHECKSUM(NEWID())) % 10 AS r
+INTO   #nl
+FROM   facturacion.Factura
+WHERE  Num_Factura BETWEEN 14 AND 114;
+
+SELECT x.Num_Factura, l.n AS linea,
+       ABS(CHECKSUM(NEWID())) AS r_item1,
+       ABS(CHECKSUM(NEWID())) AS r_item2,
+       ABS(CHECKSUM(NEWID())) AS r_cant
+INTO   #ln
+FROM   #nl x
+CROSS JOIN (VALUES (1), (2), (3)) AS l(n)
+WHERE  l.n <= CASE WHEN x.r < 5 THEN 1 WHEN x.r < 8 THEN 2 ELSE 3 END;
+
+DECLARE @n_items INT = (SELECT COUNT(*) FROM catalogo.Item_Facturable);
+
+;WITH it AS (
+    SELECT ID_Item, Costo, ROW_NUMBER() OVER (ORDER BY ID_Item) AS rn
+    FROM   catalogo.Item_Facturable
+)
+INSERT INTO facturacion.Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
+SELECT it.Costo, 1 + (l.r_cant % 2), l.Num_Factura, it.ID_Item
+FROM   #ln l
+JOIN   it ON it.rn = 1 + (l.r_item1 % (1 + (l.r_item2 % @n_items)));
+
+DROP TABLE #nl;
+DROP TABLE #ln;
 -- select * from facturacion.detalle_factura;
 
 GO
 
--- PAGO (poblacion automatica y aleatoria)
--- Se genera primero el numero aleatorio (1-4) UNA sola vez por factura en una tabla temporal.
--- (Usar CHOOSE(... NEWID() ...) directo falla: CHOOSE se expande a CASE y re-evalua NEWID().)
-SELECT Num_Factura,
-       ABS(CHECKSUM(NEWID())) % 4 + 1 AS n,
-       ABS(CHECKSUM(NEWID())) AS r_fecha
-INTO   #rnd
-FROM   facturacion.Factura;
-GO
-
-INSERT INTO facturacion.Pago (Monto, Metodo_Pago, Num_Factura)
-SELECT f.Monto,
-       CHOOSE(r.n, 'Efectivo', 'Transferencia', 'Bitcoin', 'Tarjeta'),
-       f.Num_Factura
+-- COHERENCIA DE FECHAS: la factura se emite 0-2 dias despues de su cita.
+-- (v1 dejaba 49 de 111 facturas con fecha ANTERIOR a su cita.)
+UPDATE f
+SET    f.Fecha = DATEADD(DAY, ABS(CHECKSUM(NEWID())) % 3, c.Fecha)
 FROM   facturacion.Factura f
-JOIN   #rnd r ON r.Num_Factura = f.Num_Factura
-WHERE  f.Monto > 0
-  AND  f.Num_Factura < 14;      -- las facturas 14+ se pagan abajo (con fecha aleatoria)
+JOIN   clinica.Cita c ON c.ID_Cita = f.ID_Cita;
 GO
 
--- Pago de las facturas 14+ (una sola vez, con metodo y fecha al azar).
--- Nota: el original pagaba estas facturas dos veces; el trigger de sobrepago lo bloquearia.
-DECLARE @ini DATE = DATEFROMPARTS(2015, 3, 1);
-DECLARE @fin DATE = DATEFROMPARTS(2026, 6, 19);
+-- PAGO (poblacion automatica y aleatoria, VARIABLE)
+-- Fecha_Pago = fecha de la factura + 0..14 dias (v1: fecha aleatoria 2015-2026 sin relacion).
+-- Escenarios por factura (r_tipo 0-9):
+--   0-5  (60%) pago completo en un solo pago          -> Estado_Pago = 'Pagado'
+--   6    (10%) un unico abono del 50%                  -> 'Parcial'
+--   7-8  (20%) dos abonos (40% y el resto)             -> 'Pagado'
+--   9    (10%) sin pagos                               -> 'Pendiente'
+-- Se genera primero el numero aleatorio UNA sola vez por factura en una tabla temporal.
+-- (Usar CHOOSE(... NEWID() ...) directo falla: CHOOSE se expande a CASE y re-evalua NEWID().)
+SELECT f.Num_Factura,
+       ABS(CHECKSUM(NEWID()))      AS r_metodo,
+       ABS(CHECKSUM(NEWID())) % 10 AS r_tipo,
+       ABS(CHECKSUM(NEWID())) % 15 AS r_dias
+INTO   #rnd
+FROM   facturacion.Factura f
+WHERE  f.Monto > 0;
+GO
 
+-- Primer pago (o unico)
 INSERT INTO facturacion.Pago (Num_Factura, Monto, Fecha_Pago, Metodo_Pago)
 SELECT f.Num_Factura,
-       f.Monto,                 -- pago completo: antes era un 2o pago de 8 duplicado
-       DATEADD(DAY, r.r_fecha % (DATEDIFF(DAY, @ini, @fin) + 1), @ini),
-       CHOOSE((r.r_fecha / 7) % 4 + 1, 'Efectivo', 'Transferencia', 'Bitcoin', 'Tarjeta')
+       CASE r.r_tipo WHEN 6 THEN ROUND(f.Monto * 0.5, 2)
+                     WHEN 7 THEN ROUND(f.Monto * 0.4, 2)
+                     WHEN 8 THEN ROUND(f.Monto * 0.4, 2)
+                     ELSE f.Monto END,
+       DATEADD(DAY, r.r_dias, CAST(f.Fecha AS DATETIME2(0))),
+       CHOOSE(r.r_metodo % 4 + 1, 'Efectivo', 'Transferencia', 'Bitcoin', 'Tarjeta')
 FROM   facturacion.Factura f
 JOIN   #rnd r ON r.Num_Factura = f.Num_Factura
-WHERE  f.Num_Factura BETWEEN 14 AND 114;
+WHERE  r.r_tipo <> 9;
+GO
+
+-- Segundo abono: el saldo restante (el trigger de sobrepago lo valida)
+INSERT INTO facturacion.Pago (Num_Factura, Monto, Fecha_Pago, Metodo_Pago)
+SELECT f.Num_Factura,
+       f.Monto - (SELECT SUM(p.Monto) FROM facturacion.Pago p WHERE p.Num_Factura = f.Num_Factura),
+       DATEADD(DAY, r.r_dias + 10, CAST(f.Fecha AS DATETIME2(0))),
+       CHOOSE((r.r_metodo / 7) % 4 + 1, 'Efectivo', 'Transferencia', 'Bitcoin', 'Tarjeta')
+FROM   facturacion.Factura f
+JOIN   #rnd r ON r.Num_Factura = f.Num_Factura
+WHERE  r.r_tipo IN (7, 8);
 GO
 
 DROP TABLE #rnd;
 GO
 
 -- SELECT * FROM facturacion.Pago;
+
+/*
+---------------------------------------------------------------------------------------------------------
+Agregacion de datos de volumen
+---------------------------------------------------------------------------------------------------------
+*/
+
+USE Veterinaria;
+GO
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+DECLARE @ExtraCitas  INT  = 165;                 -- citas historicas nuevas
+DECLARE @Programadas INT  = 25;                  -- citas futuras (el trigger no las cancela)
+DECLARE @Ini         DATE = '2022-01-01';
+DECLARE @Fin         DATE = '2026-06-30';
+
+BEGIN TRY
+BEGIN TRAN;
+
+/* ---------- Catalogos numerados (no depende de que los IDs sean consecutivos) ---------- */
+SELECT ID_Mascota, Fecha_Nacimiento, ROW_NUMBER() OVER (ORDER BY ID_Mascota) AS rn
+INTO   #masc FROM clientes.Mascota;
+SELECT ID_Veterinario, ROW_NUMBER() OVER (ORDER BY ID_Veterinario) AS rn
+INTO   #vet FROM clinica.Veterinario;
+SELECT DISTINCT Descripcion INTO #desc0 FROM clinica.Diagnostico;
+SELECT Descripcion, ROW_NUMBER() OVER (ORDER BY Descripcion) AS rn INTO #desc FROM #desc0;
+SELECT ID_Procedimiento, ROW_NUMBER() OVER (ORDER BY ID_Procedimiento) AS rn
+INTO   #proc FROM catalogo.Procedimiento;
+SELECT ID_Item, Costo, ROW_NUMBER() OVER (ORDER BY ID_Item) AS rn
+INTO   #item FROM catalogo.Item_Facturable;
+
+DECLARE @nm INT = (SELECT COUNT(*) FROM #masc);
+DECLARE @nv INT = (SELECT COUNT(*) FROM #vet);
+DECLARE @nd INT = (SELECT COUNT(*) FROM #desc);
+DECLARE @np INT = (SELECT COUNT(*) FROM #proc);
+DECLARE @ni INT = (SELECT COUNT(*) FROM #item);
+
+/* 
+1) CITAS
+   Los aleatorios se guardan primero en #rc (NEWID dentro de CASE/CHOOSE se re-evalua).
+*/
+SELECT TOP (@ExtraCitas + @Programadas)
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n,
+       ABS(CHECKSUM(NEWID()))      AS r_masc,
+       ABS(CHECKSUM(NEWID()))      AS r_vet,
+       ABS(CHECKSUM(NEWID()))      AS r_fecha,
+       ABS(CHECKSUM(NEWID()))      AS r_hora,
+       ABS(CHECKSUM(NEWID()))      AS r_cons,
+       ABS(CHECKSUM(NEWID())) % 10 AS r_est
+INTO   #rc
+FROM   sys.all_objects a CROSS JOIN sys.all_objects b;
+
+CREATE TABLE #citas_nuevas (
+    ID_Cita BIGINT PRIMARY KEY, Fecha DATE, Estado VARCHAR(15), ID_Mascota BIGINT);
+
+INSERT INTO clinica.Cita (Fecha, Hora, Consultorio, Estado, ID_Mascota, ID_Veterinario)
+OUTPUT inserted.ID_Cita, inserted.Fecha, inserted.Estado, inserted.ID_Mascota
+  INTO #citas_nuevas (ID_Cita, Fecha, Estado, ID_Mascota)
+SELECT CASE WHEN r.n <= @ExtraCitas THEN sf.Fecha_Hist
+            ELSE DATEADD(DAY, 1 + (r.r_fecha % 45), CAST(GETDATE() AS DATE)) END,
+       CAST(DATEADD(MINUTE, (r.r_hora % 19) * 30, CAST('08:00:00' AS TIME(0))) AS TIME(0)),  -- 08:00 a 17:00
+       CHOOSE(r.r_cons % 3 + 1, 'Consultorio A', 'Consultorio B', 'Consultorio C'),
+       CASE WHEN r.n > @ExtraCitas THEN 'Programada'
+            WHEN r.r_est = 0       THEN 'Cancelada'      -- ~10% canceladas
+            ELSE 'Completada' END,
+       m.ID_Mascota,
+       v.ID_Veterinario
+FROM   #rc r
+JOIN   #masc m ON m.rn = 1 + (r.r_masc % @nm)
+JOIN   #vet  v ON v.rn = 1 + (r.r_vet  % @nv)
+-- la cita nunca es anterior al nacimiento de la mascota
+CROSS APPLY (SELECT CASE WHEN m.Fecha_Nacimiento > @Ini THEN m.Fecha_Nacimiento ELSE @Ini END AS Desde) d
+CROSS APPLY (SELECT CASE WHEN DATEDIFF(DAY, d.Desde, @Fin) < 0 THEN 0
+                         ELSE DATEDIFF(DAY, d.Desde, @Fin) END AS Dias) sp
+CROSS APPLY (SELECT DATEADD(DAY, r.r_fecha % (sp.Dias + 1), d.Desde) AS Fecha_Hist) sf;
+
+/*
+2) DIAGNOSTICOS
+   solo citas Completadas; 25% con un segundo diagnostico)
+*/
+SELECT ID_Cita, ABS(CHECKSUM(NEWID())) AS r_extra
+INTO   #rd FROM #citas_nuevas WHERE Estado = 'Completada';
+
+SELECT x.ID_Cita, k.n, ABS(CHECKSUM(NEWID())) AS r_desc
+INTO   #dg
+FROM   #rd x
+CROSS JOIN (VALUES (1), (2)) AS k(n)
+WHERE  k.n = 1 OR x.r_extra % 4 = 0;
+
+CREATE TABLE #diag_nuevos (ID_Diagnostico BIGINT PRIMARY KEY, ID_Cita BIGINT);
+
+INSERT INTO clinica.Diagnostico (Descripcion, ID_Cita)
+OUTPUT inserted.ID_Diagnostico, inserted.ID_Cita INTO #diag_nuevos (ID_Diagnostico, ID_Cita)
+SELECT ds.Descripcion, g.ID_Cita
+FROM   #dg g
+JOIN   #desc ds ON ds.rn = 1 + (g.r_desc % @nd);
+
+/* 
+3) DIAGNOSTICO_PROCEDIMIENTO
+   ~40% de los diagnosticos nuevos)
+*/
+SELECT ID_Diagnostico,
+       ABS(CHECKSUM(NEWID())) % 10 AS r_tiene,
+       ABS(CHECKSUM(NEWID()))      AS r_proc
+INTO   #rp FROM #diag_nuevos;
+
+INSERT INTO clinica.Diagnostico_Procedimiento (ID_Diagnostico, ID_Procedimiento)
+SELECT p.ID_Diagnostico, pr.ID_Procedimiento
+FROM   #rp p
+JOIN   #proc pr ON pr.rn = 1 + (p.r_proc % @np)
+WHERE  p.r_tiene < 4;
+
+/* 
+4) FACTURAS (~75% de las citas completadas)
+   ID_Propietario sale de la mascota: el trigger de seguridad exige que sea el duenio real. */
+SELECT cn.ID_Cita, cn.Fecha, m.ID_Propietario, ABS(CHECKSUM(NEWID())) % 100 AS r_fac
+INTO   #fx
+FROM   #citas_nuevas cn
+JOIN   clientes.Mascota m ON m.ID_Mascota = cn.ID_Mascota
+WHERE  cn.Estado = 'Completada';
+
+CREATE TABLE #fact_nuevas (Num_Factura BIGINT PRIMARY KEY, ID_Cita BIGINT);
+
+INSERT INTO facturacion.Factura (Fecha, Monto, ID_Cita, ID_Propietario)
+OUTPUT inserted.Num_Factura, inserted.ID_Cita INTO #fact_nuevas (Num_Factura, ID_Cita)
+SELECT DATEADD(DAY, r_fac % 3, Fecha), 0, ID_Cita, ID_Propietario   -- Monto lo recalcula el trigger
+FROM   #fx
+WHERE  r_fac < 75;
+
+/* 
+5) DETALLE (1 a 3 lineas; items baratos mas frecuentes que cirugias)
+*/
+SELECT Num_Factura, ABS(CHECKSUM(NEWID())) % 10 AS r INTO #nl2 FROM #fact_nuevas;
+
+SELECT x.Num_Factura, l.n AS linea,
+       ABS(CHECKSUM(NEWID())) AS r_item1,
+       ABS(CHECKSUM(NEWID())) AS r_item2,
+       ABS(CHECKSUM(NEWID())) AS r_cant
+INTO   #ln2
+FROM   #nl2 x
+CROSS JOIN (VALUES (1), (2), (3)) AS l(n)
+WHERE  l.n <= CASE WHEN x.r < 5 THEN 1 WHEN x.r < 8 THEN 2 ELSE 3 END;
+
+INSERT INTO facturacion.Detalle_Factura (Precio_Unitario, Cantidad, Num_Factura, ID_Item)
+SELECT i.Costo, 1 + (l.r_cant % 2), l.Num_Factura, i.ID_Item
+FROM   #ln2 l
+JOIN   #item i ON i.rn = 1 + (l.r_item1 % (1 + (l.r_item2 % @ni)));
+
+/* 
+6) PAGOS: 60% completo, 10% parcial, 20% dos abonos, 10% pendiente
+*/
+SELECT f.Num_Factura,
+       ABS(CHECKSUM(NEWID()))      AS r_metodo,
+       ABS(CHECKSUM(NEWID())) % 10 AS r_tipo,
+       ABS(CHECKSUM(NEWID())) % 15 AS r_dias
+INTO   #rnd2
+FROM   facturacion.Factura f
+JOIN   #fact_nuevas fn ON fn.Num_Factura = f.Num_Factura
+WHERE  f.Monto > 0;
+
+INSERT INTO facturacion.Pago (Num_Factura, Monto, Fecha_Pago, Metodo_Pago)
+SELECT f.Num_Factura,
+       CASE r.r_tipo WHEN 6 THEN ROUND(f.Monto * 0.5, 2)
+                     WHEN 7 THEN ROUND(f.Monto * 0.4, 2)
+                     WHEN 8 THEN ROUND(f.Monto * 0.4, 2)
+                     ELSE f.Monto END,
+       DATEADD(DAY, r.r_dias, CAST(f.Fecha AS DATETIME2(0))),
+       CHOOSE(r.r_metodo % 4 + 1, 'Efectivo', 'Transferencia', 'Bitcoin', 'Tarjeta')
+FROM   facturacion.Factura f
+JOIN   #rnd2 r ON r.Num_Factura = f.Num_Factura
+WHERE  r.r_tipo <> 9;
+
+INSERT INTO facturacion.Pago (Num_Factura, Monto, Fecha_Pago, Metodo_Pago)
+SELECT f.Num_Factura,
+       f.Monto - (SELECT SUM(p.Monto) FROM facturacion.Pago p WHERE p.Num_Factura = f.Num_Factura),
+       DATEADD(DAY, r.r_dias + 10, CAST(f.Fecha AS DATETIME2(0))),
+       CHOOSE((r.r_metodo / 7) % 4 + 1, 'Efectivo', 'Transferencia', 'Bitcoin', 'Tarjeta')
+FROM   facturacion.Factura f
+JOIN   #rnd2 r ON r.Num_Factura = f.Num_Factura
+WHERE  r.r_tipo IN (7, 8);
+
+COMMIT TRAN;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+    THROW;
+END CATCH;
+GO
+
+/* 
+7)Verificacion 
+*/
+SELECT 'Cita' AS Tabla, COUNT(*) AS Filas FROM clinica.Cita
+UNION ALL SELECT 'Diagnostico',               COUNT(*) FROM clinica.Diagnostico
+UNION ALL SELECT 'Diagnostico_Procedimiento', COUNT(*) FROM clinica.Diagnostico_Procedimiento
+UNION ALL SELECT 'Factura',                   COUNT(*) FROM facturacion.Factura
+UNION ALL SELECT 'Detalle_Factura',           COUNT(*) FROM facturacion.Detalle_Factura
+UNION ALL SELECT 'Pago',                      COUNT(*) FROM facturacion.Pago;
+
+SELECT Estado,      COUNT(*) AS Citas    FROM clinica.Cita           GROUP BY Estado;
+SELECT Estado_Pago, COUNT(*) AS Facturas FROM facturacion.Factura   GROUP BY Estado_Pago;
+SELECT YEAR(Fecha) AS Anio, COUNT(*) AS Citas FROM clinica.Cita     GROUP BY YEAR(Fecha) ORDER BY Anio;
+GO
+-- Las temporales (#...) se eliminan solas al cerrar la sesion.
