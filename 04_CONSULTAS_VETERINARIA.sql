@@ -1,6 +1,6 @@
 /* =====================================================================
    VETERINARIA - 3 CONSULTAS CON FUNCIONES VENTANA: ANTES vs DESPUES
- 
+
    CONSULTAS
    1) Ingresos por veterinario y mes (gerencial)
       Ventanas: RANK, LAG, SUM acumulado, SUM por mes (% del mes)
@@ -14,33 +14,29 @@
 
    ===================================================================== */
 USE Veterinaria;
-GO
 SET NOCOUNT ON;
-GO
- 
+
 /* =====================================================================
    CONSULTA 1: INGRESOS POR VETERINARIO Y MES
    ===================================================================== */
- 
+
 -- Estado "ANTES": sin los indices 
 DROP INDEX IF EXISTS IX_Cita_Fecha         ON clinica.Cita;
 DROP INDEX IF EXISTS IX_Cita_Mascota_Fecha ON clinica.Cita;
 DROP INDEX IF EXISTS IX_Factura_Fecha      ON facturacion.Factura;
 DROP INDEX IF EXISTS IX_Pago_Factura       ON facturacion.Pago;
 DROP INDEX IF EXISTS IX_Diagnostico_Cita   ON clinica.Diagnostico;
-GO
 UPDATE STATISTICS clinica.Cita        WITH FULLSCAN;
 UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
 CHECKPOINT;
 DBCC DROPCLEANBUFFERS;
 ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
-GO
- 
+
 -- CONSULTA 1 - ANTES
 DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
- 
+
 WITH IngresosMes AS (
     SELECT c.ID_Veterinario,
            DATEFROMPARTS(YEAR(c.Fecha), MONTH(c.Fecha), 1) AS Mes,
@@ -63,25 +59,23 @@ FROM   IngresosMes im
 JOIN   clinica.Veterinario v ON v.ID_Veterinario = im.ID_Veterinario
 ORDER BY im.Mes, Ranking_Mes
 OPTION (RECOMPILE);
- 
+
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
 GO
- 
+
 -- Estado "DESPUES": crear indice
 CREATE INDEX IX_Cita_Fecha ON clinica.Cita (Fecha) INCLUDE (ID_Veterinario, Estado);
-GO
 UPDATE STATISTICS clinica.Cita WITH FULLSCAN;
 CHECKPOINT;
 DBCC DROPCLEANBUFFERS;
 ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
-GO
- 
--- CONSULTA 1 - DESPUES 
+
+-- CONSULTA 1 - DESPUES
 DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
- 
+
 WITH IngresosMes AS (
     SELECT c.ID_Veterinario,
            DATEFROMPARTS(YEAR(c.Fecha), MONTH(c.Fecha), 1) AS Mes,
@@ -104,36 +98,32 @@ FROM   IngresosMes im
 JOIN   clinica.Veterinario v ON v.ID_Veterinario = im.ID_Veterinario
 ORDER BY im.Mes, Ranking_Mes
 OPTION (RECOMPILE);
- 
+
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
-GO
- 
- 
+
 /* =====================================================================
    CONSULTA 2: CARTERA PENDIENTE DE COBRO POR PROPIETARIO
    (facturas emitidas en el rango con saldo = Monto - suma de pagos)
    ===================================================================== */
- 
+
 -- Estado "ANTES": sin los indices
 DROP INDEX IF EXISTS IX_Cita_Fecha         ON clinica.Cita;
 DROP INDEX IF EXISTS IX_Cita_Mascota_Fecha ON clinica.Cita;
 DROP INDEX IF EXISTS IX_Factura_Fecha      ON facturacion.Factura;
 DROP INDEX IF EXISTS IX_Pago_Factura       ON facturacion.Pago;
 DROP INDEX IF EXISTS IX_Diagnostico_Cita   ON clinica.Diagnostico;
-GO
 UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
 UPDATE STATISTICS facturacion.Pago    WITH FULLSCAN;
 CHECKPOINT;
 DBCC DROPCLEANBUFFERS;
 ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
-GO
- 
+
 -- CONSULTA 2 - ANTES
 DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
- 
+
 WITH Saldos AS (
     SELECT f.Num_Factura, f.ID_Propietario, f.Fecha, f.Estado_Pago, f.Monto,
            ISNULL(pg.Pagado, 0)           AS Pagado,
@@ -160,27 +150,25 @@ FROM   Pendientes pe
 JOIN   clientes.Propietario pr ON pr.ID_Propietario = pe.ID_Propietario
 ORDER BY Ranking_Deudor, pe.Fecha, pe.Num_Factura
 OPTION (RECOMPILE);
- 
+
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
 GO
- 
+
 -- Estado "DESPUES": crear indices
 CREATE INDEX IX_Factura_Fecha ON facturacion.Factura (Fecha) INCLUDE (ID_Propietario, Estado_Pago, Monto);
 CREATE INDEX IX_Pago_Factura  ON facturacion.Pago (Num_Factura) INCLUDE (Monto);   -- la FK no tenia indice
-GO
 UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
 UPDATE STATISTICS facturacion.Pago    WITH FULLSCAN;
 CHECKPOINT;
 DBCC DROPCLEANBUFFERS;
 ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
-GO
- 
--- CONSULTA 2 - DESPUES 
+
+-- CONSULTA 2 - DESPUES
 DECLARE @Desde DATE = '2026-03-01', @Hasta DATE = '2026-06-01';
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
- 
+
 WITH Saldos AS (
     SELECT f.Num_Factura, f.ID_Propietario, f.Fecha, f.Estado_Pago, f.Monto,
            ISNULL(pg.Pagado, 0)           AS Pagado,
@@ -207,24 +195,21 @@ FROM   Pendientes pe
 JOIN   clientes.Propietario pr ON pr.ID_Propietario = pe.ID_Propietario
 ORDER BY Ranking_Deudor, pe.Fecha, pe.Num_Factura
 OPTION (RECOMPILE);
- 
+
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
-GO
- 
- 
+
 /* =====================================================================
    CONSULTA 3: FICHA DE VISITAS DE LAS MASCOTAS DE UN PROPIETARIO
    (el propietario se elige solo: el que mas visitas no canceladas tiene)
    ===================================================================== */
- 
+
 -- Estado "ANTES": sin los indices
 DROP INDEX IF EXISTS IX_Cita_Fecha         ON clinica.Cita;
 DROP INDEX IF EXISTS IX_Cita_Mascota_Fecha ON clinica.Cita;
 DROP INDEX IF EXISTS IX_Factura_Fecha      ON facturacion.Factura;
 DROP INDEX IF EXISTS IX_Pago_Factura       ON facturacion.Pago;
 DROP INDEX IF EXISTS IX_Diagnostico_Cita   ON clinica.Diagnostico;
-GO
 UPDATE STATISTICS clinica.Cita        WITH FULLSCAN;
 UPDATE STATISTICS clientes.Mascota    WITH FULLSCAN;
 UPDATE STATISTICS clinica.Diagnostico WITH FULLSCAN;
@@ -232,8 +217,7 @@ UPDATE STATISTICS facturacion.Factura WITH FULLSCAN;
 CHECKPOINT;
 DBCC DROPCLEANBUFFERS;
 ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
-GO
- 
+
 -- CONSULTA 3 - ANTES
 
 DECLARE @ID_Propietario BIGINT = (
@@ -245,7 +229,7 @@ DECLARE @ID_Propietario BIGINT = (
     ORDER BY COUNT(*) DESC, m.ID_Propietario);
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
- 
+
 SELECT pr.Nombre AS Propietario, m.Nombre AS Mascota, m.Especie,
        c.Fecha, c.Estado, dg.Diagnosticos, f.Monto,
        ROW_NUMBER() OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora) AS Nro_Visita,
@@ -263,23 +247,21 @@ WHERE  m.ID_Propietario = @ID_Propietario
   AND  c.Estado <> 'Cancelada'
 ORDER BY m.Nombre, Nro_Visita
 OPTION (RECOMPILE);
- 
+
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
 GO
- 
+
 -- Estado "DESPUES": crear indices
 CREATE INDEX IX_Cita_Mascota_Fecha ON clinica.Cita (ID_Mascota, Fecha, Hora) INCLUDE (Estado);
 CREATE INDEX IX_Diagnostico_Cita   ON clinica.Diagnostico (ID_Cita) INCLUDE (Descripcion);   -- la FK no tenia indice
-GO
 UPDATE STATISTICS clinica.Cita        WITH FULLSCAN;
 UPDATE STATISTICS clinica.Diagnostico WITH FULLSCAN;
 CHECKPOINT;
 DBCC DROPCLEANBUFFERS;
 ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
-GO
- 
--- CONSULTA 3 - DESPUES 
+
+-- CONSULTA 3 - DESPUES
 DECLARE @ID_Propietario BIGINT = (
     SELECT TOP 1 m.ID_Propietario
     FROM   clinica.Cita c
@@ -289,7 +271,7 @@ DECLARE @ID_Propietario BIGINT = (
     ORDER BY COUNT(*) DESC, m.ID_Propietario);
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
- 
+
 SELECT pr.Nombre AS Propietario, m.Nombre AS Mascota, m.Especie,
        c.Fecha, c.Estado, dg.Diagnosticos, f.Monto,
        ROW_NUMBER() OVER (PARTITION BY m.ID_Mascota ORDER BY c.Fecha, c.Hora) AS Nro_Visita,
@@ -307,12 +289,10 @@ WHERE  m.ID_Propietario = @ID_Propietario
   AND  c.Estado <> 'Cancelada'
 ORDER BY m.Nombre, Nro_Visita
 OPTION (RECOMPILE);
- 
+
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
-GO
- 
- 
+
 /* =====================================================================
    INDICES CREADOS PARA LAS CONSULTAS 1, 2 Y 3
    ===================================================================== */
@@ -321,9 +301,7 @@ CREATE INDEX IX_Factura_Fecha ON facturacion.Factura (Fecha) INCLUDE (ID_Propiet
 CREATE INDEX IX_Pago_Factura  ON facturacion.Pago (Num_Factura) INCLUDE (Monto);
 CREATE INDEX IX_Cita_Mascota_Fecha ON clinica.Cita (ID_Mascota, Fecha, Hora) INCLUDE (Estado);
 CREATE INDEX IX_Diagnostico_Cita   ON clinica.Diagnostico (ID_Cita) INCLUDE (Descripcion); 
-GO
- 
- 
+
 /* =====================================================================
    COSTO DE LOS INDICES 
    ===================================================================== */
@@ -340,11 +318,9 @@ WHERE  i.object_id IN (OBJECT_ID(N'clinica.Cita'), OBJECT_ID(N'clinica.Diagnosti
                        OBJECT_ID(N'facturacion.Factura'), OBJECT_ID(N'facturacion.Pago'))
 GROUP BY i.object_id, i.name, i.type_desc
 ORDER BY Tabla, i.type_desc, i.name;
-GO
- 
+
 /* =========================================================================
    USO DE LOS INDICES DESDE EL ULTIMO REINICIO DEL SERVIDOR
-   
    ========================================================================= */
 SELECT i.name AS Indice, us.user_seeks, us.user_scans, us.user_lookups, us.user_updates
 FROM   sys.indexes i
@@ -352,5 +328,3 @@ LEFT JOIN sys.dm_db_index_usage_stats us
        ON us.object_id = i.object_id AND us.index_id = i.index_id AND us.database_id = DB_ID()
 WHERE  i.name IN (N'IX_Cita_Fecha', N'IX_Cita_Mascota_Fecha', N'IX_Factura_Fecha',
                   N'IX_Pago_Factura', N'IX_Diagnostico_Cita');
-GO
- 
