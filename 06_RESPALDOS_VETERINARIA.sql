@@ -75,14 +75,17 @@ GO
 
 
 /* =====================================================================
-   4) JOB 1: RESPALDO COMPLETO (FULL) - Diario a las 9:00 p.m. (21:00)
+   4) JOB 1: RESPALDO COMPLETO (FULL) + RETENCION DE 14 DIAS
+   Ejecucion: Diario a las 9:00 p.m. (21:00).
+   Paso 1: Genera el Full diario comprimido.
+   Paso 2: Si el Paso 1 tiene exito, purga .bak y .trn con > 14 dias.
    ===================================================================== */
 DECLARE @jobId_Full BINARY(16);
 
 EXEC msdb.dbo.sp_add_job
     @job_name = N'Job_Veterinaria_Backup_Full',
     @enabled = 1,
-    @description = N'Respaldo completo diario de Veterinaria a las 21:00 (linea base fuera de horario).',
+    @description = N'Respaldo completo diario de Veterinaria (21:00) y purga de respaldos mayores a 14 dias.',
     @category_name = N'Database Maintenance',
     @owner_login_name = N'sa',
     @notify_level_eventlog = 2,
@@ -90,9 +93,10 @@ EXEC msdb.dbo.sp_add_job
     @notify_email_operator_name = N'Op_DBA_Veterinaria',
     @job_id = @jobId_Full OUTPUT;
 
+-- Paso 1: Generar el respaldo Full diario
 EXEC msdb.dbo.sp_add_jobstep
     @job_id = @jobId_Full,
-    @step_name = N'Paso_Backup_Full_Veterinaria',
+    @step_name = N'Paso_1_Backup_Full_Veterinaria',
     @step_id = 1,
     @subsystem = N'TSQL',
     @database_name = N'master',
@@ -105,7 +109,36 @@ TO DISK = @Ruta
 WITH INIT, CHECKSUM, COMPRESSION, STATS = 10,
      NAME = N''Veterinaria - Respaldo Completo Diario'';
 ',
-    @on_success_action = 1,
+    @on_success_action = 3, -- 3 = Ir al Paso 2 (solo si el Full de hoy tuvo exito)
+    @on_fail_action = 2;    -- 2 = Detener con error (conserva los backups viejos)
+
+-- Paso 2: Eliminar respaldos (.bak y .trn) con mas de 14 dias de antiguedad
+EXEC msdb.dbo.sp_add_jobstep
+    @job_id = @jobId_Full,
+    @step_name = N'Paso_2_Purga_Retencion_14Dias',
+    @step_id = 2,
+    @subsystem = N'TSQL',
+    @database_name = N'master',
+    @command = N'
+DECLARE @FechaLimite DATETIME = DATEADD(DAY, -14, SYSDATETIME());
+
+-- Purgar respaldos Full y Diferenciales (.bak) anteriores a 14 dias
+EXECUTE master.dbo.xp_delete_file
+    0,                                      -- 0 = Archivos de respaldo
+    N''/var/opt/mssql/backups_veterinaria/'', -- Directorio de respaldos
+    N''bak'',                                 -- Extension .bak
+    @FechaLimite,                           -- Fecha limite de retencion
+    0;                                      -- 0 = No incluir subcarpetas
+
+-- Purgar respaldos de Log (.trn) anteriores a 14 dias
+EXECUTE master.dbo.xp_delete_file
+    0,
+    N''/var/opt/mssql/backups_veterinaria/'',
+    N''trn'',
+    @FechaLimite,
+    0;
+',
+    @on_success_action = 1, -- 1 = Finalizar Job con exito
     @on_fail_action = 2;
 
 EXEC msdb.dbo.sp_add_jobschedule
@@ -308,3 +341,98 @@ GO
 DBCC CHECKDB (N'Veterinaria') WITH NO_INFOMSGS;
 GO
 */
+
+-- 1. Ver los nombres lógicos internos del respaldo FULL (necesarios para WITH MOVE)
+RESTORE FILELISTONLY 
+FROM DISK = N'/var/opt/mssql/backups_veterinaria/Veterinaria_Full_YYYYMMDD_HHMMSS.bak';
+GO
+--O usar una consulta select para obtener los nombres lógicos de los archivos
+SELECT 
+    name AS [Nombre_Logico (Para WITH MOVE)],
+    type_desc AS [Tipo_Archivo],
+    physical_name AS [Ruta_Fisica_Actual]
+FROM sys.master_files
+WHERE database_id = DB_ID(N'Veterinaria');
+
+-- 2. Obtener en orden cronológico exacto los archivos de la cadena actual
+SELECT 
+    s.backup_start_date AS [Fecha y Hora],
+    CASE s.type 
+        WHEN 'D' THEN N'1. FULL (Usar MOVE + NORECOVERY + REPLACE)'
+        WHEN 'I' THEN N'2. DIFERENCIAL (Solo último Diff + NORECOVERY)'
+        WHEN 'L' THEN N'3. LOG (Todos los posteriores en orden)'
+    END AS [Capa / Instruccion],
+    m.physical_device_name AS [Ruta Exacta]
+FROM msdb.dbo.backupset s
+JOIN msdb.dbo.backupmediafamily m ON s.media_set_id = m.media_set_id
+WHERE s.database_name = N'Veterinaria'
+ORDER BY s.backup_start_date ASC;
+GO
+
+USE master;
+GO
+
+-- Para restaurar en otra base de datos:
+IF DB_ID(N'Veterinaria_Restaurada') IS NOT NULL
+BEGIN
+    ALTER DATABASE [Veterinaria_Restaurada] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE [Veterinaria_Restaurada];
+END
+CREATE DATABASE [Veterinaria_Restaurada];
+GO
+
+--Secuencia para restaurar los respaldos en otra base de datos
+-- 1. RESTAURAR FULL (Obligatorio: MOVE + NORECOVERY + REPLACE)
+RESTORE DATABASE [Veterinaria_Restaurada]
+FROM DISK = N'/var/opt/mssql/backups_veterinaria/Veterinaria_Full_YYYYMMDD_HHMMSS.bak'
+WITH 
+    MOVE N'Veterinaria'     TO N'/var/opt/mssql/data/Veterinaria_Restaurada.mdf',
+    MOVE N'Veterinaria_log' TO N'/var/opt/mssql/data/Veterinaria_Restaurada_log.ldf',
+    NORECOVERY,
+    REPLACE,
+    STATS = 10;
+GO
+
+-- 2. RESTAURAR ÚLTIMO DIFERENCIAL (Ya NO lleva MOVE, mantiene NORECOVERY)
+RESTORE DATABASE [Veterinaria_Restaurada]
+FROM DISK = N'/var/opt/mssql/backups_veterinaria/Veterinaria_Diff_YYYYMMDD_HHMMSS.bak'
+WITH NORECOVERY;
+GO
+
+-- 3. RESTAURAR LOGS INTERMEDIOS (Todos los .trn posteriores al último Diff con NORECOVERY)
+RESTORE LOG [Veterinaria_Restaurada]
+FROM DISK = N'/var/opt/mssql/backups_veterinaria/Veterinaria_Log_YYYYMMDD_HHMMSS.trn'
+WITH NORECOVERY;
+GO
+
+-- 4. RESTAURAR ÚLTIMO LOG Y PONER EN LÍNEA (WITH RECOVERY)
+RESTORE LOG [Veterinaria_Restaurada]
+FROM DISK = N'/var/opt/mssql/backups_veterinaria/Veterinaria_Log_YYYYMMDD_HHMMSS.trn'
+WITH RECOVERY;
+GO
+
+
+--Comprobar que ambas bases de datos sean iguales
+-- 1. Verificar estado de ambas bases de datos
+SELECT name, state_desc, recovery_model_desc 
+FROM sys.databases 
+WHERE name IN (N'Veterinaria', N'Veterinaria_Restaurada');
+
+-- 2. Comparar conteo de registros entre la original y la restaurada
+SELECT 'Original' AS Origen,
+       (SELECT COUNT(*) FROM Veterinaria.clientes.Propietario) AS Propietarios,
+       (SELECT COUNT(*) FROM Veterinaria.clientes.Mascota)     AS Mascotas,
+       (SELECT COUNT(*) FROM Veterinaria.clinica.Cita)         AS Citas,
+       (SELECT COUNT(*) FROM Veterinaria.facturacion.Factura)  AS Facturas
+UNION ALL
+SELECT 'Restaurada' AS Origen,
+       (SELECT COUNT(*) FROM Veterinaria_Restaurada.clientes.Propietario),
+       (SELECT COUNT(*) FROM Veterinaria_Restaurada.clientes.Mascota),
+       (SELECT COUNT(*) FROM Veterinaria_Restaurada.clinica.Cita),
+       (SELECT COUNT(*) FROM Veterinaria_Restaurada.facturacion.Factura);
+
+-- 3. Validar integridad física y lógica de la nueva base (WRT)
+DBCC CHECKDB (N'Veterinaria_Restaurada') WITH NO_INFOMSGS;
+GO
+
+
