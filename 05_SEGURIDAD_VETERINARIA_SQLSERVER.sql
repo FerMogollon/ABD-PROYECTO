@@ -4,7 +4,8 @@
    Requisitos:
      - Servidor en modo de autenticacion mixta (SQL Server + Windows).
      - Ejecutar con un login sysadmin.
-     - Carpeta C:\SQLAudit\ para la auditoria (cambiar la ruta si es Linux).
+     - La auditoria se guarda en la carpeta Log de la instancia (el servicio de SQL Server
+       ya tiene permiso de escritura ahi, no hay que crear ni configurar carpetas).
 
    POLITICAS DE SEGURIDAD IMPLEMENTADAS
    P1. Minimo privilegio: los permisos se dan a ROLES (nunca a usuarios) y solo
@@ -275,15 +276,6 @@ GO
 USE master;
 GO
 
--- Crear la carpeta de auditoria (Windows). En Linux usar otra ruta, p. ej. /var/opt/mssql/audit/
-BEGIN TRY
-    EXEC master.sys.xp_create_subdir N'C:\SQLAudit\';
-END TRY
-BEGIN CATCH
-    PRINT 'No se pudo crear C:\SQLAudit\ automaticamente: crearla a mano o cambiar la ruta.';
-END CATCH;
-GO
-
 -- Limpiar versiones anteriores para poder re-ejecutar el script
 IF EXISTS (SELECT 1 FROM sys.server_audit_specifications WHERE name = N'Audit_Veterinaria_Servidor')
 BEGIN
@@ -297,9 +289,15 @@ BEGIN
 END
 GO
 
-CREATE SERVER AUDIT Audit_Veterinaria
-TO FILE (FILEPATH = N'C:\SQLAudit\', MAXSIZE = 50 MB, MAX_ROLLOVER_FILES = 10)
-WITH (ON_FAILURE = CONTINUE);
+-- Los archivos .sqlaudit se guardan en la carpeta Log de la instancia (junto al ERRORLOG)
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1);
+DECLARE @sql  NVARCHAR(MAX) =
+    N'CREATE SERVER AUDIT Audit_Veterinaria TO FILE (FILEPATH = N''' + @ruta +
+    N''', MAXSIZE = 50 MB, MAX_ROLLOVER_FILES = 10) WITH (ON_FAILURE = CONTINUE);';
+EXEC sys.sp_executesql @sql;
+PRINT 'Auditoria guardada en: ' + @ruta;
 GO
 
 -- Eventos de servidor: logins fallidos/exitosos y cambios de logins, roles y permisos
@@ -431,9 +429,11 @@ GO
 SELECT dp.name AS rol,
        p.state_desc AS estado,
        p.permission_name AS permiso,
-       CASE p.class_desc WHEN 'SCHEMA' THEN 'SCHEMA::' + s.name
-                         WHEN 'OBJECT_OR_COLUMN' THEN 'OBJECT::' + OBJECT_SCHEMA_NAME(p.major_id) + '.' + OBJECT_NAME(p.major_id)
-                         ELSE p.class_desc END AS sobre
+       CASE p.class_desc
+            WHEN 'SCHEMA'           THEN N'SCHEMA::' + s.name COLLATE DATABASE_DEFAULT
+            WHEN 'OBJECT_OR_COLUMN' THEN N'OBJECT::' + OBJECT_SCHEMA_NAME(p.major_id) + N'.' + OBJECT_NAME(p.major_id)
+            ELSE p.class_desc COLLATE DATABASE_DEFAULT
+       END AS sobre
 FROM   sys.database_permissions p
 JOIN   sys.database_principals dp ON dp.principal_id = p.grantee_principal_id
 LEFT JOIN sys.schemas s ON p.class_desc = 'SCHEMA' AND s.schema_id = p.major_id
@@ -460,15 +460,23 @@ UPDATE catalogo.Medicamento SET Stock = Stock - 1 WHERE ID_Medicamento = 12;   -
 GO
 
 -- 7.3 Eventos de SQL Server Audit (logins fallidos, cambios de permisos, DML sensible)
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1) + N'Audit_Veterinaria*.sqlaudit';
+
 SELECT event_time, action_id, succeeded, server_principal_name, database_name,
        schema_name, object_name, statement
-FROM   sys.fn_get_audit_file(N'C:\SQLAudit\*.sqlaudit', DEFAULT, DEFAULT)
+FROM   sys.fn_get_audit_file(@ruta, DEFAULT, DEFAULT)
 ORDER BY event_time DESC;
 GO
 
 -- 7.4 Solo accesos fallidos (LGIF = failed login)
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1) + N'Audit_Veterinaria*.sqlaudit';
+
 SELECT event_time, server_principal_name, client_ip, application_name
-FROM   sys.fn_get_audit_file(N'C:\SQLAudit\*.sqlaudit', DEFAULT, DEFAULT)
+FROM   sys.fn_get_audit_file(@ruta, DEFAULT, DEFAULT)
 WHERE  action_id = 'LGIF'
 ORDER BY event_time DESC;
 GO
