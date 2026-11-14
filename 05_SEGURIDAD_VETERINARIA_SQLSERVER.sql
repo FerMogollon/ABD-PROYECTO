@@ -47,6 +47,8 @@ IF SUSER_ID(N'lg_farmacia')    IS NULL CREATE LOGIN lg_farmacia    WITH PASSWORD
 IF SUSER_ID(N'lg_bi')          IS NULL CREATE LOGIN lg_bi          WITH PASSWORD = N'Vet#PowerBI2026!Secure', CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
 IF SUSER_ID(N'lg_auditor')     IS NULL CREATE LOGIN lg_auditor     WITH PASSWORD = N'Vet#Auditor2026!Secure', CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
 IF SUSER_ID(N'lg_backup')      IS NULL CREATE LOGIN lg_backup      WITH PASSWORD = N'Vet#Backup2026!Secure',  CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
+IF SUSER_ID(N'lg_profesor')    IS NULL CREATE LOGIN lg_profesor   WITH PASSWORD = N'Vet#Profesor2026!Secure',   CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
+IF SUSER_ID(N'lg_estudiante')  IS NULL CREATE LOGIN lg_estudiante WITH PASSWORD = N'Vet#Estudiante2026!Secure', CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
 GO
 
 -- P3: deshabilitar sa. DESCOMENTAR solo si NO estas conectado como sa (te quedarias sin acceso).
@@ -69,6 +71,8 @@ IF DATABASE_PRINCIPAL_ID(N'rol_farmacia')     IS NULL CREATE ROLE rol_farmacia;
 IF DATABASE_PRINCIPAL_ID(N'rol_analista_bi')  IS NULL CREATE ROLE rol_analista_bi;
 IF DATABASE_PRINCIPAL_ID(N'rol_auditor')      IS NULL CREATE ROLE rol_auditor;
 IF DATABASE_PRINCIPAL_ID(N'rol_backup')       IS NULL CREATE ROLE rol_backup;
+IF DATABASE_PRINCIPAL_ID(N'rol_profesor')     IS NULL CREATE ROLE rol_profesor;
+IF DATABASE_PRINCIPAL_ID(N'rol_estudiante')   IS NULL CREATE ROLE rol_estudiante;
 GO
 
 -- 2.2 Usuarios de base de datos (esquema por defecto segun su funcion)
@@ -80,6 +84,8 @@ IF DATABASE_PRINCIPAL_ID(N'usr_farmacia')    IS NULL CREATE USER usr_farmacia   
 IF DATABASE_PRINCIPAL_ID(N'usr_bi')          IS NULL CREATE USER usr_bi          FOR LOGIN lg_bi          WITH DEFAULT_SCHEMA = reportes;
 IF DATABASE_PRINCIPAL_ID(N'usr_auditor')     IS NULL CREATE USER usr_auditor     FOR LOGIN lg_auditor     WITH DEFAULT_SCHEMA = auditoria;
 IF DATABASE_PRINCIPAL_ID(N'usr_backup')      IS NULL CREATE USER usr_backup      FOR LOGIN lg_backup      WITH DEFAULT_SCHEMA = dbo;
+IF DATABASE_PRINCIPAL_ID(N'usr_profesor')    IS NULL CREATE USER usr_profesor   FOR LOGIN lg_profesor   WITH DEFAULT_SCHEMA = dbo;
+IF DATABASE_PRINCIPAL_ID(N'usr_estudiante')  IS NULL CREATE USER usr_estudiante FOR LOGIN lg_estudiante WITH DEFAULT_SCHEMA = dbo;
 GO
 
 -- 2.3 Usuario -> rol
@@ -91,6 +97,10 @@ ALTER ROLE rol_farmacia    ADD MEMBER usr_farmacia;
 ALTER ROLE rol_analista_bi ADD MEMBER usr_bi;
 ALTER ROLE rol_auditor     ADD MEMBER usr_auditor;
 ALTER ROLE rol_backup      ADD MEMBER usr_backup;
+ALTER ROLE rol_profesor    ADD MEMBER usr_profesor;
+ALTER ROLE rol_estudiante  ADD MEMBER usr_estudiante;
+ALTER ROLE db_owner        ADD MEMBER rol_profesor;
+ALTER ROLE db_datareader   ADD MEMBER rol_estudiante;
 GO
 
 /* 2.4 Permisos por rol (lo que no se otorga queda denegado por defecto) */
@@ -138,6 +148,8 @@ GRANT SELECT ON SCHEMA::auditoria                         TO rol_auditor;
 ALTER ROLE db_backupoperator ADD MEMBER rol_backup;
 GO
 
+-- rol_estudiante: solo el auditor puede leer la bitacora
+DENY SELECT ON SCHEMA::auditoria TO rol_estudiante;
 
 /* =====================================================================
    3) VISTAS PARA POWER BI (esquema reportes, sin datos personales)
