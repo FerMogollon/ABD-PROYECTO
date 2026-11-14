@@ -437,7 +437,45 @@ END CATCH;
 REVERT;
 GO
 
--- 6.9 Resumen de permisos efectivos por rol
+-- 6.9 Estudiante: solo lectura (datos enmascarados, sin escribir, sin bitacora)
+EXECUTE AS USER = 'usr_estudiante';
+SELECT TOP (3) Nombre, DUI, Correo, Telefono FROM clientes.Propietario;      -- enmascarados
+BEGIN TRY
+    DELETE FROM facturacion.Pago WHERE ID_Pago = -1;
+END TRY
+BEGIN CATCH
+    PRINT 'Esperado (estudiante no escribe): ' + ERROR_MESSAGE();
+END CATCH;
+BEGIN TRY
+    SELECT TOP (1) * FROM auditoria.Bitacora;
+END TRY
+BEGIN CATCH
+    PRINT 'Esperado (estudiante no ve la bitacora): ' + ERROR_MESSAGE();
+END CATCH;
+REVERT;
+GO
+
+-- 6.10 Auditor: lee la bitacora pero no puede modificarla
+EXECUTE AS USER = 'usr_auditor';
+SELECT TOP (3) ID_Bitacora, Fecha, Tabla, Operacion, Usuario FROM auditoria.Bitacora ORDER BY ID_Bitacora DESC;
+BEGIN TRY
+    UPDATE auditoria.Bitacora SET Tabla = Tabla WHERE ID_Bitacora = -1;
+END TRY
+BEGIN CATCH
+    PRINT 'Esperado (auditor no modifica la bitacora): ' + ERROR_MESSAGE();
+END CATCH;
+REVERT;
+GO
+
+-- 6.11 Profesor: puede crear y borrar objetos (db_owner)
+EXECUTE AS USER = 'usr_profesor';
+CREATE TABLE dbo.prueba_profesor (id INT);
+DROP TABLE dbo.prueba_profesor;
+PRINT 'Profesor: creo y borro un objeto sin problemas.';
+REVERT;
+GO
+
+-- 6.12 Resumen de permisos efectivos por rol
 SELECT dp.name AS rol,
        p.state_desc AS estado,
        p.permission_name AS permiso,
@@ -452,7 +490,6 @@ LEFT JOIN sys.schemas s ON p.class_desc = 'SCHEMA' AND s.schema_id = p.major_id
 WHERE  dp.name LIKE 'rol[_]%'
 ORDER BY dp.name, p.state_desc, sobre, p.permission_name;
 GO
-
 
 /* =====================================================================
    7) CONSULTA DE LOGS DE AUDITORIA
@@ -492,3 +529,14 @@ FROM   sys.fn_get_audit_file(@ruta, DEFAULT, DEFAULT)
 WHERE  action_id = 'LGIF'
 ORDER BY event_time DESC;
 GO
+
+-- Sin ruidos ni conexiones cortadas
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1) + N'Audit_Veterinaria*.sqlaudit';
+
+SELECT TOP (10) event_time, server_principal_name, client_ip, statement
+FROM   sys.fn_get_audit_file(@ruta, DEFAULT, DEFAULT)
+WHERE  action_id = 'LGIF'
+  AND  statement NOT LIKE N'Network error%'
+ORDER BY event_time DESC;
