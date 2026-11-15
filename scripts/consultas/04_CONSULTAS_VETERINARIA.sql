@@ -296,11 +296,16 @@ SET STATISTICS TIME OFF;
 /* =====================================================================
    INDICES CREADOS PARA LAS CONSULTAS 1, 2 Y 3
    ===================================================================== */
-CREATE INDEX IX_Cita_Fecha ON clinica.Cita (Fecha) INCLUDE (ID_Veterinario, Estado);
-CREATE INDEX IX_Factura_Fecha ON facturacion.Factura (Fecha) INCLUDE (ID_Propietario, Estado_Pago, Monto);
-CREATE INDEX IX_Pago_Factura  ON facturacion.Pago (Num_Factura) INCLUDE (Monto);
-CREATE INDEX IX_Cita_Mascota_Fecha ON clinica.Cita (ID_Mascota, Fecha, Hora) INCLUDE (Estado);
-CREATE INDEX IX_Diagnostico_Cita   ON clinica.Diagnostico (ID_Cita) INCLUDE (Descripcion); 
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Cita_Fecha' AND object_id = OBJECT_ID(N'clinica.Cita'))
+    CREATE INDEX IX_Cita_Fecha ON clinica.Cita (Fecha) INCLUDE (ID_Veterinario, Estado);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Factura_Fecha' AND object_id = OBJECT_ID(N'facturacion.Factura'))
+    CREATE INDEX IX_Factura_Fecha ON facturacion.Factura (Fecha) INCLUDE (ID_Propietario, Estado_Pago, Monto);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Pago_Factura' AND object_id = OBJECT_ID(N'facturacion.Pago'))
+    CREATE INDEX IX_Pago_Factura ON facturacion.Pago (Num_Factura) INCLUDE (Monto);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Cita_Mascota_Fecha' AND object_id = OBJECT_ID(N'clinica.Cita'))
+    CREATE INDEX IX_Cita_Mascota_Fecha ON clinica.Cita (ID_Mascota, Fecha, Hora) INCLUDE (Estado);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Diagnostico_Cita' AND object_id = OBJECT_ID(N'clinica.Diagnostico'))
+    CREATE INDEX IX_Diagnostico_Cita ON clinica.Diagnostico (ID_Cita) INCLUDE (Descripcion);
 
 /* =====================================================================
    COSTO DE LOS INDICES 

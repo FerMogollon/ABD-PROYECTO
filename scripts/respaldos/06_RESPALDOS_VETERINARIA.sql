@@ -15,6 +15,10 @@ solo debe correr:
      2. Diferencial (Diff)   : Cada 3 horas (09:00, 12:00, 15:00, 18:00) - Maximo 11 logs en cadena.
      3. Log de Transacciones : Cada 15 minutos (08:00 a 20:00) - RPO <= 15 minutos.
      4. Tail-Log (Desastre)  : Ejecucion manual inmediata ante falla - RPO = 0 (Point-in-Time).
+
+   OBJETIVOS DE RECUPERACION:
+     RPO <= 15 minutos (de 08:00 a 20:00, horario del job de Log; la clinica no opera de noche).
+     RTO <= 30 minutos = deteccion (~10) + Tail-Log (~1) + restauracion medida (seccion 10) + CHECKDB + reconexion (~5).
    ===================================================================== */
 
 USE master;
