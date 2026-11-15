@@ -4,7 +4,8 @@
    Requisitos:
      - Servidor en modo de autenticacion mixta (SQL Server + Windows).
      - Ejecutar con un login sysadmin.
-     - Carpeta C:\SQLAudit\ para la auditoria (cambiar la ruta si es Linux).
+     - La auditoria se guarda en la carpeta Log de la instancia (el servicio de SQL Server
+       ya tiene permiso de escritura ahi, no hay que crear ni configurar carpetas).
 
    POLITICAS DE SEGURIDAD IMPLEMENTADAS
    P1. Minimo privilegio: los permisos se dan a ROLES (nunca a usuarios) y solo
@@ -46,6 +47,8 @@ IF SUSER_ID(N'lg_farmacia')    IS NULL CREATE LOGIN lg_farmacia    WITH PASSWORD
 IF SUSER_ID(N'lg_bi')          IS NULL CREATE LOGIN lg_bi          WITH PASSWORD = N'Vet#PowerBI2026!Secure', CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
 IF SUSER_ID(N'lg_auditor')     IS NULL CREATE LOGIN lg_auditor     WITH PASSWORD = N'Vet#Auditor2026!Secure', CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
 IF SUSER_ID(N'lg_backup')      IS NULL CREATE LOGIN lg_backup      WITH PASSWORD = N'Vet#Backup2026!Secure',  CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
+IF SUSER_ID(N'lg_profesor')    IS NULL CREATE LOGIN lg_profesor   WITH PASSWORD = N'Vet#Profesor2026!Secure',   CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
+IF SUSER_ID(N'lg_estudiante')  IS NULL CREATE LOGIN lg_estudiante WITH PASSWORD = N'Vet#Estudiante2026!Secure', CHECK_POLICY = ON, CHECK_EXPIRATION = ON, DEFAULT_DATABASE = Veterinaria;
 GO
 
 -- P3: deshabilitar sa. DESCOMENTAR solo si NO estas conectado como sa (te quedarias sin acceso).
@@ -68,6 +71,8 @@ IF DATABASE_PRINCIPAL_ID(N'rol_farmacia')     IS NULL CREATE ROLE rol_farmacia;
 IF DATABASE_PRINCIPAL_ID(N'rol_analista_bi')  IS NULL CREATE ROLE rol_analista_bi;
 IF DATABASE_PRINCIPAL_ID(N'rol_auditor')      IS NULL CREATE ROLE rol_auditor;
 IF DATABASE_PRINCIPAL_ID(N'rol_backup')       IS NULL CREATE ROLE rol_backup;
+IF DATABASE_PRINCIPAL_ID(N'rol_profesor')     IS NULL CREATE ROLE rol_profesor;
+IF DATABASE_PRINCIPAL_ID(N'rol_estudiante')   IS NULL CREATE ROLE rol_estudiante;
 GO
 
 -- 2.2 Usuarios de base de datos (esquema por defecto segun su funcion)
@@ -79,6 +84,8 @@ IF DATABASE_PRINCIPAL_ID(N'usr_farmacia')    IS NULL CREATE USER usr_farmacia   
 IF DATABASE_PRINCIPAL_ID(N'usr_bi')          IS NULL CREATE USER usr_bi          FOR LOGIN lg_bi          WITH DEFAULT_SCHEMA = reportes;
 IF DATABASE_PRINCIPAL_ID(N'usr_auditor')     IS NULL CREATE USER usr_auditor     FOR LOGIN lg_auditor     WITH DEFAULT_SCHEMA = auditoria;
 IF DATABASE_PRINCIPAL_ID(N'usr_backup')      IS NULL CREATE USER usr_backup      FOR LOGIN lg_backup      WITH DEFAULT_SCHEMA = dbo;
+IF DATABASE_PRINCIPAL_ID(N'usr_profesor')    IS NULL CREATE USER usr_profesor   FOR LOGIN lg_profesor   WITH DEFAULT_SCHEMA = dbo;
+IF DATABASE_PRINCIPAL_ID(N'usr_estudiante')  IS NULL CREATE USER usr_estudiante FOR LOGIN lg_estudiante WITH DEFAULT_SCHEMA = dbo;
 GO
 
 -- 2.3 Usuario -> rol
@@ -90,6 +97,10 @@ ALTER ROLE rol_farmacia    ADD MEMBER usr_farmacia;
 ALTER ROLE rol_analista_bi ADD MEMBER usr_bi;
 ALTER ROLE rol_auditor     ADD MEMBER usr_auditor;
 ALTER ROLE rol_backup      ADD MEMBER usr_backup;
+ALTER ROLE rol_profesor    ADD MEMBER usr_profesor;
+ALTER ROLE rol_estudiante  ADD MEMBER usr_estudiante;
+ALTER ROLE db_owner        ADD MEMBER rol_profesor;
+ALTER ROLE db_datareader   ADD MEMBER rol_estudiante;
 GO
 
 /* 2.4 Permisos por rol (lo que no se otorga queda denegado por defecto) */
@@ -137,6 +148,8 @@ GRANT SELECT ON SCHEMA::auditoria                         TO rol_auditor;
 ALTER ROLE db_backupoperator ADD MEMBER rol_backup;
 GO
 
+-- rol_estudiante: solo el auditor puede leer la bitacora
+DENY SELECT ON SCHEMA::auditoria TO rol_estudiante;
 
 /* =====================================================================
    3) VISTAS PARA POWER BI (esquema reportes, sin datos personales)
@@ -275,15 +288,6 @@ GO
 USE master;
 GO
 
--- Crear la carpeta de auditoria (Windows). En Linux usar otra ruta, p. ej. /var/opt/mssql/audit/
-BEGIN TRY
-    EXEC master.sys.xp_create_subdir N'C:\SQLAudit\';
-END TRY
-BEGIN CATCH
-    PRINT 'No se pudo crear C:\SQLAudit\ automaticamente: crearla a mano o cambiar la ruta.';
-END CATCH;
-GO
-
 -- Limpiar versiones anteriores para poder re-ejecutar el script
 IF EXISTS (SELECT 1 FROM sys.server_audit_specifications WHERE name = N'Audit_Veterinaria_Servidor')
 BEGIN
@@ -297,9 +301,15 @@ BEGIN
 END
 GO
 
-CREATE SERVER AUDIT Audit_Veterinaria
-TO FILE (FILEPATH = N'C:\SQLAudit\', MAXSIZE = 50 MB, MAX_ROLLOVER_FILES = 10)
-WITH (ON_FAILURE = CONTINUE);
+-- Los archivos .sqlaudit se guardan en la carpeta Log de la instancia (junto al ERRORLOG)
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1);
+DECLARE @sql  NVARCHAR(MAX) =
+    N'CREATE SERVER AUDIT Audit_Veterinaria TO FILE (FILEPATH = N''' + @ruta +
+    N''', MAXSIZE = 50 MB, MAX_ROLLOVER_FILES = 10) WITH (ON_FAILURE = CONTINUE);';
+EXEC sys.sp_executesql @sql;
+PRINT 'Auditoria guardada en: ' + @ruta;
 GO
 
 -- Eventos de servidor: logins fallidos/exitosos y cambios de logins, roles y permisos
@@ -427,20 +437,59 @@ END CATCH;
 REVERT;
 GO
 
--- 6.9 Resumen de permisos efectivos por rol
+-- 6.9 Estudiante: solo lectura (datos enmascarados, sin escribir, sin bitacora)
+EXECUTE AS USER = 'usr_estudiante';
+SELECT TOP (3) Nombre, DUI, Correo, Telefono FROM clientes.Propietario;      -- enmascarados
+BEGIN TRY
+    DELETE FROM facturacion.Pago WHERE ID_Pago = -1;
+END TRY
+BEGIN CATCH
+    PRINT 'Esperado (estudiante no escribe): ' + ERROR_MESSAGE();
+END CATCH;
+BEGIN TRY
+    SELECT TOP (1) * FROM auditoria.Bitacora;
+END TRY
+BEGIN CATCH
+    PRINT 'Esperado (estudiante no ve la bitacora): ' + ERROR_MESSAGE();
+END CATCH;
+REVERT;
+GO
+
+-- 6.10 Auditor: lee la bitacora pero no puede modificarla
+EXECUTE AS USER = 'usr_auditor';
+SELECT TOP (3) ID_Bitacora, Fecha, Tabla, Operacion, Usuario FROM auditoria.Bitacora ORDER BY ID_Bitacora DESC;
+BEGIN TRY
+    UPDATE auditoria.Bitacora SET Tabla = Tabla WHERE ID_Bitacora = -1;
+END TRY
+BEGIN CATCH
+    PRINT 'Esperado (auditor no modifica la bitacora): ' + ERROR_MESSAGE();
+END CATCH;
+REVERT;
+GO
+
+-- 6.11 Profesor: puede crear y borrar objetos (db_owner)
+EXECUTE AS USER = 'usr_profesor';
+CREATE TABLE dbo.prueba_profesor (id INT);
+DROP TABLE dbo.prueba_profesor;
+PRINT 'Profesor: creo y borro un objeto sin problemas.';
+REVERT;
+GO
+
+-- 6.12 Resumen de permisos efectivos por rol
 SELECT dp.name AS rol,
        p.state_desc AS estado,
        p.permission_name AS permiso,
-       CASE p.class_desc WHEN 'SCHEMA' THEN 'SCHEMA::' + s.name
-                         WHEN 'OBJECT_OR_COLUMN' THEN 'OBJECT::' + OBJECT_SCHEMA_NAME(p.major_id) + '.' + OBJECT_NAME(p.major_id)
-                         ELSE p.class_desc END AS sobre
+       CASE p.class_desc
+            WHEN 'SCHEMA'           THEN N'SCHEMA::' + s.name COLLATE DATABASE_DEFAULT
+            WHEN 'OBJECT_OR_COLUMN' THEN N'OBJECT::' + OBJECT_SCHEMA_NAME(p.major_id) + N'.' + OBJECT_NAME(p.major_id)
+            ELSE p.class_desc COLLATE DATABASE_DEFAULT
+       END AS sobre
 FROM   sys.database_permissions p
 JOIN   sys.database_principals dp ON dp.principal_id = p.grantee_principal_id
 LEFT JOIN sys.schemas s ON p.class_desc = 'SCHEMA' AND s.schema_id = p.major_id
 WHERE  dp.name LIKE 'rol[_]%'
 ORDER BY dp.name, p.state_desc, sobre, p.permission_name;
 GO
-
 
 /* =====================================================================
    7) CONSULTA DE LOGS DE AUDITORIA
@@ -460,15 +509,34 @@ UPDATE catalogo.Medicamento SET Stock = Stock - 1 WHERE ID_Medicamento = 12;   -
 GO
 
 -- 7.3 Eventos de SQL Server Audit (logins fallidos, cambios de permisos, DML sensible)
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1) + N'Audit_Veterinaria*.sqlaudit';
+
 SELECT event_time, action_id, succeeded, server_principal_name, database_name,
        schema_name, object_name, statement
-FROM   sys.fn_get_audit_file(N'C:\SQLAudit\*.sqlaudit', DEFAULT, DEFAULT)
+FROM   sys.fn_get_audit_file(@ruta, DEFAULT, DEFAULT)
 ORDER BY event_time DESC;
 GO
 
 -- 7.4 Solo accesos fallidos (LGIF = failed login)
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1) + N'Audit_Veterinaria*.sqlaudit';
+
 SELECT event_time, server_principal_name, client_ip, application_name
-FROM   sys.fn_get_audit_file(N'C:\SQLAudit\*.sqlaudit', DEFAULT, DEFAULT)
+FROM   sys.fn_get_audit_file(@ruta, DEFAULT, DEFAULT)
 WHERE  action_id = 'LGIF'
 ORDER BY event_time DESC;
 GO
+
+-- Sin ruidos ni conexiones cortadas
+DECLARE @err  NVARCHAR(500) = CAST(SERVERPROPERTY('ErrorLogFileName') AS NVARCHAR(500));
+DECLARE @sep  NCHAR(1)      = CASE WHEN @err LIKE N'%\%' THEN N'\' ELSE N'/' END;
+DECLARE @ruta NVARCHAR(500) = LEFT(@err, LEN(@err) - CHARINDEX(@sep, REVERSE(@err)) + 1) + N'Audit_Veterinaria*.sqlaudit';
+
+SELECT TOP (10) event_time, server_principal_name, client_ip, statement
+FROM   sys.fn_get_audit_file(@ruta, DEFAULT, DEFAULT)
+WHERE  action_id = 'LGIF'
+  AND  statement NOT LIKE N'Network error%'
+ORDER BY event_time DESC;
